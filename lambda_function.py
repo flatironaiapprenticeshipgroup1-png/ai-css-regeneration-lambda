@@ -6,14 +6,14 @@ from openai import OpenAI
 
 s3 = boto3.client("s3")
 secrets_client = boto3.client("secretsmanager")
-secret = json.loads(
-    secrets_client.get_secret_value(SecretId=os.environ["SECRET_NAME"])["SecretString"]
-)
-client = OpenAI(api_key=secret["OpenAIAPIKey"])
 
 
 def lambda_handler(event, context):
     try:
+        secret = json.loads(
+            secrets_client.get_secret_value(SecretId=os.environ["SECRET_NAME"])["SecretString"]
+        )
+        client = OpenAI(api_key=secret["OpenAIAPIKey"])
         for record in event["Records"]:
             body = json.loads(record["body"])
             website_id = body["RegeneratedWebsiteId"]
