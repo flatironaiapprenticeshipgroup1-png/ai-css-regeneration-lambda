@@ -12,10 +12,15 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.14"
 
       - name: Install dependencies into package directory
-        run: pip install boto3 openai --target ./package
+        run: |
+          pip install openai \
+            --target ./package \
+            --platform manylinux2014_x86_64 \
+            --python-version 3.14 \
+            --only-binary=:all:
 
       - name: Build zip
         run: |
