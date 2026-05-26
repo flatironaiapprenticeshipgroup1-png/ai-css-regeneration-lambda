@@ -22,7 +22,7 @@ def _boto3_client_factory(service, **kwargs):
 
 with patch("boto3.client", side_effect=_boto3_client_factory), \
      patch("openai.OpenAI", return_value=_mock_openai_client):
-    from handler import lambda_handler
+    from lambda_function import lambda_handler
 
 
 def make_event(website_id="test-123", url="https://example.com", theme="cyberpunk"):
