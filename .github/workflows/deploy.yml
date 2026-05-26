@@ -22,7 +22,7 @@ jobs:
           cd package
           zip -r ../lambda.zip .
           cd ..
-          zip lambda.zip handler.py
+          zip lambda.zip lambda_function.py
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
