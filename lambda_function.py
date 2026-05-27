@@ -167,7 +167,9 @@ def lambda_handler(event, context):
                         Use background-image gradients where appropriate,
 
                         ANIMATIONS:
-                        Add animations like hover effects or keyframe animations that fit the theme, if the theme requires it
+                        Add animations like hover effects or keyframe animations that fit the theme
+
+                        also add cool dramatic animations in the background to make the website more visually appealing and engaging
 
                         RULES:
                         Return ONLY valid CSS — no explanations, no markdown, no code fences,
