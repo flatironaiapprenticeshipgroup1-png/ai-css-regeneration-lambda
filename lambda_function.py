@@ -99,8 +99,9 @@ def lambda_handler(event, context):
                 Key={"RegeneratedWebsiteId": website_id, "RegeneratedWebsiteUrl": website_url}
             ).get("Item", {})
             current_status = existing.get("RegenerationStatus")
-            if current_status in ("processing", "completed"):
+            if current_status in ("ai_lambda_processing", "completed"):
                 print(f"Skipping duplicate invocation for {website_id}: status is already '{current_status}'")
+                publish(step="Finalizing", status="completed", message="Finished Css Regeneration")
                 continue
 
             table.update_item(
@@ -159,7 +160,7 @@ def lambda_handler(event, context):
 
                 publish(
                     step=f"regenerating_css_chunks_completed",
-                    status="processing",
+                    status="ai_lambda_processing",
                     message=f"Regenerated chunk {chunk_index + 1} of {total_chunks}"
                 )
                 return response.choices[0].message.content
@@ -184,13 +185,13 @@ def lambda_handler(event, context):
                 )
 
             # Split into chunks if the file is large
-            publish(step="chunking", status="processing", message="Compressing CSS into chunks for processing")
+            publish(step="chunking", status="ai_lambda_processing", message="Compressing CSS into chunks for processing")
             chunks = split_css_into_chunks(content)
             print(f"Split CSS into {len(chunks)} chunk(s) for processing")
 
             # process all chunks in parallel (I/O-bound — threads wait on OpenAI, not CPU)
             results = {}
-            publish(step="regenerating_css", status="processing", message="Ai Regenerating Styling CSS for the website")
+            publish(step="regenerating_css", status="ai_lambda_processing", message="Ai Regenerating Styling CSS for the website")
             with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
                 futures = {
                     executor.submit(regenerate_css_chunk, client, chunk, theme_prompt, i, len(chunks)): i
