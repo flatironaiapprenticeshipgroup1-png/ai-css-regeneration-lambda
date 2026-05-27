@@ -9,7 +9,7 @@ from openai import OpenAI
 s3 = boto3.client("s3")
 secrets_client = boto3.client("secretsmanager")
 dynamodb = boto3.resource("dynamodb")
-MAX_CHARS_PER_CHUNK = 60_000 * 4
+MAX_CHARS_PER_CHUNK = 12_000
 
 
 def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
@@ -133,6 +133,7 @@ def regenerate_css_chunk(
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
         ],
+        max_tokens=16384,
     )
     return response.choices[0].message.content
 
