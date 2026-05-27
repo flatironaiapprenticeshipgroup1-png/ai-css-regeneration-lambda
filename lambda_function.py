@@ -166,6 +166,9 @@ def lambda_handler(event, context):
                         Add or rewrite box-shadow, text-shadow, and gradients,
                         Use background-image gradients where appropriate,
 
+                        ANIMATIONS:
+                        Add animations like hover effects or keyframe animations that fit the theme, if the theme requires it
+
                         RULES:
                         Return ONLY valid CSS — no explanations, no markdown, no code fences,
                         Do not remove any CSS selectors or classes — every original selector must appear in your output,
