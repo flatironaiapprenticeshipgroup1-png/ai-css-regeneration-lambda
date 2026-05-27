@@ -82,21 +82,28 @@ def generate_style_guide(client: OpenAI, css: str, theme_prompt: str) -> str:
             {
                 "role": "system",
                 "content": (
-                    "You are a CSS design-systems expert. "
-                    "Analyse the CSS provided and return a concise JSON style guide. "
+                    "You are a CSS design-systems expert and creative director. "
+                    "Your job is to create a style guide that fully transforms a website's visual identity to match a given theme. "
+                    "The theme MUST be the dominant influence — every color, font, spacing, and decoration choice must reflect it. "
+                    "Do NOT preserve the original site's colors or fonts unless they happen to match the theme. "
                     "Return ONLY valid JSON — no markdown fences, no extra text."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"{theme_prompt}\n\n"
-                    "Analyse this CSS and return a JSON style guide with these keys:\n"
+                    f"THEME TO APPLY: {theme_prompt}\n\n"
+                    "You MUST design every value in the style guide to strongly reflect this theme. "
+                    "For example, if the theme is 'retro and pink', every color should be pink/retro-inspired, "
+                    "fonts should feel retro, borders and shadows should match a retro aesthetic, etc. "
+                    "Do NOT copy the original site's colors. Invent new values that fit the theme.\n\n"
+                    "Return a JSON style guide with these keys:\n"
                     "primary_color, secondary_color, accent_color, background_color, text_color, "
                     "font_family_body, font_family_heading, base_font_size, line_height, "
                     "border_radius, spacing_unit, box_shadow, button_style, link_style, "
                     "any_other_key_design_tokens.\n\n"
-                    f"CSS sample:\n{sample}"
+                    "For button_style and link_style use nested JSON objects with relevant CSS properties.\n\n"
+                    f"Original CSS structure (for layout/selector reference only — ignore its colors/fonts):\n{sample}"
                 ),
             },
         ],
