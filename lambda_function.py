@@ -11,7 +11,7 @@ from openai import OpenAI
 s3 = boto3.client("s3")
 secrets_client = boto3.client("secretsmanager")
 dynamodb = boto3.resource("dynamodb")
-MAX_CHARS_PER_CHUNK = 12_000
+MAX_CHARS_PER_CHUNK = 30_000
 
 def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
     blocks = []
@@ -140,13 +140,12 @@ def lambda_handler(event, context):
                 system_msg = (
                     "You are a CSS and web design expert. "
                     "You will receive a portion of a larger CSS file. "
-                    "Regenerate ONLY the CSS rules provided — do not add new rules or remove existing ones. "
-                    "Return valid CSS only, with no markdown fences, no explanations, and no extra text."
+                    "Your job is to regenerate the CSS based on a theme"
                 )
                 user_msg = (
                     f"{theme_prompt}\n\n"
                     f"This is chunk {chunk_index + 1} of {total_chunks} from the full stylesheet. "
-                    f"Regenerate these CSS rules:\n\n{chunk}"
+                    f"Regenerate this css: {chunk}"
                 )
                 print(f"Processing chunk {chunk_index + 1}/{total_chunks} ({len(chunk)} chars)...")
                 response = client.chat.completions.create(
@@ -175,13 +174,11 @@ def lambda_handler(event, context):
 
             if regeneration_theme is None:
                 theme_prompt = (
-                    "No specific theme provided. Regenerate the CSS using modern practices "
-                    "while maintaining the original feel and intent."
+                    "Regenerate the CSS using modern practices while maintaining the original feel and intent."
                 )
             else:
                 theme_prompt = (
-                    f"Regenerate the CSS using the theme: {regeneration_theme}. "
-                    "Ensure the CSS follows modern practices."
+                    f"Regenerate the CSS using the theme: {regeneration_theme}."
                 )
 
             # Split into chunks if the file is large
@@ -211,6 +208,7 @@ def lambda_handler(event, context):
                 Key=f"{website_id}/Regenerated-Styles.css",
                 Body=regenerated_css.encode("utf-8"),
                 ContentType="text/css",
+                CacheControl="no-store, no-cache, must-revalidate",
             )
             print(f"Regenerated CSS saved to S3 for website ID {website_id}")
 
