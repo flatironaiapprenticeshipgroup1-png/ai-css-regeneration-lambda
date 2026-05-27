@@ -5,10 +5,21 @@ Processes SQS records containing regeneration requests, reads original CSS from 
 calls OpenAI to regenerate CSS, saves results to S3, and publishes status updates
 via the Ably real-time messaging service.
 
+Sequence ordering
+-----------------
+Each SQS record initialises its sequence counter from the DynamoDB item written
+by the crawler lambda (via get_current_sequence).  This ensures the AI phase's
+events are globally ordered *after* the crawler phase's events on the same Ably
+channel.  The frontend subscriber deduplicates by sequence number, so without
+this initialisation all AI events (sequences 1–N) would be discarded because the
+crawler already published sequences 1–M.
+
 Environment Variables:
-  - SECRET_NAME: AWS Secrets Manager secret ID containing OpenAI API key
-  - BUCKET_NAME: S3 bucket containing original CSS files
-  - RESULT_BASE_URL: (optional) Base URL for generating result links in status updates
+  - SECRET_NAME:      AWS Secrets Manager secret ID containing OpenAI API key.
+  - BUCKET_NAME:      S3 bucket containing original CSS files.
+  - DYNAMODB_TABLE_NAME: DynamoDB table for status persistence and sequence reads.
+  - ABLY_SECRET_NAME: AWS Secrets Manager secret ID containing Ably API key.
+  - RESULT_BASE_URL:  (optional) Base URL for generating result links in status updates.
 """
 
 import json
@@ -16,7 +27,9 @@ import os
 
 import boto3
 from openai import OpenAI
-from status_publisher import publish_status_update
+# get_current_sequence reads the crawler's last persisted sequence from DynamoDB
+# so the AI phase continues the global counter rather than restarting at 1.
+from status_publisher import get_current_sequence, publish_status_update
 
 s3 = boto3.client("s3")
 secrets_client = boto3.client("secretsmanager")
@@ -45,12 +58,12 @@ def lambda_handler(event, context):
       }
 
     Args:
-        event: SQS event containing records with regeneration requests
-        context: Lambda context object
+        event: SQS event containing records with regeneration requests.
+        context: Lambda context object.
 
     Returns:
-        dict: HTTP response with statusCode and body
-              200 on success, 500 on failure
+        dict: HTTP response with statusCode and body.
+              200 on success, 500 on failure.
     """
     for record in event["Records"]:
         body = json.loads(record["body"])
@@ -58,7 +71,10 @@ def lambda_handler(event, context):
         url = body.get("RegeneratedWebsiteUrl", "")
         theme = body.get("RegenerationTheme", "")
 
-        seq = 0
+        # Seed the AI phase's sequence counter from the crawler's last persisted
+        # value so the AI events form a continuous stream with the crawler events.
+        # get_current_sequence degrades gracefully to 0 if the read fails.
+        seq = get_current_sequence(website_id, url)
 
         def publish(step, status, message, result_url=None, error=None):
             """Publish a status update with auto-incrementing sequence number."""
@@ -66,6 +82,9 @@ def lambda_handler(event, context):
             seq += 1
             publish_status_update(
                 website_id=website_id,
+                # website_url is the DynamoDB sort key — required by the confirmed
+                # composite key schema (RegeneratedWebsiteId + RegeneratedWebsiteUrl).
+                website_url=url,
                 phase="ai",
                 step=step,
                 status=status,
