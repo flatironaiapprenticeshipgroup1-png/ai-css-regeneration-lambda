@@ -140,7 +140,7 @@ def lambda_handler(event, context):
                 system_msg = (
                     "You are a CSS and web design expert. "
                     "You will receive a portion of a larger CSS file. "
-                    "Your job is to regenerate the CSS based on a theme"
+                    "Your job is to dramatically regenerate the CSS based on a theme. CHANGE EVERYTHING. Be creative in your regeneration. use different fonts, move divs around and make sure the change is dramatic. Make sure the change is accurate to the theme as well."
                 )
                 user_msg = (
                     f"{theme_prompt}\n\n"
@@ -149,7 +149,7 @@ def lambda_handler(event, context):
                 )
                 print(f"Processing chunk {chunk_index + 1}/{total_chunks} ({len(chunk)} chars)...")
                 response = client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model="gpt-4o",
                     messages=[
                         {"role": "system", "content": system_msg},
                         {"role": "user", "content": user_msg},
