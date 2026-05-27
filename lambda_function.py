@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 from openai import OpenAI
@@ -72,7 +73,47 @@ def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> lis
     return chunks
 
 
-def regenerate_css_chunk(client: OpenAI, chunk: str, theme_prompt: str, chunk_index: int, total_chunks: int) -> str:
+def generate_style_guide(client: OpenAI, css: str, theme_prompt: str) -> str:
+    sample = css[:40_000]
+    print("Generating style guide from CSS sample...")
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a CSS design-systems expert. "
+                    "Analyse the CSS provided and return a concise JSON style guide. "
+                    "Return ONLY valid JSON — no markdown fences, no extra text."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"{theme_prompt}\n\n"
+                    "Analyse this CSS and return a JSON style guide with these keys:\n"
+                    "primary_color, secondary_color, accent_color, background_color, text_color, "
+                    "font_family_body, font_family_heading, base_font_size, line_height, "
+                    "border_radius, spacing_unit, box_shadow, button_style, link_style, "
+                    "any_other_key_design_tokens.\n\n"
+                    f"CSS sample:\n{sample}"
+                ),
+            },
+        ],
+    )
+    style_guide = response.choices[0].message.content
+    print(f"Style guide generated: {style_guide}")
+    return style_guide
+
+
+def regenerate_css_chunk(
+    client: OpenAI,
+    chunk: str,
+    theme_prompt: str,
+    style_guide: str,
+    chunk_index: int,
+    total_chunks: int,
+) -> str:
     system_msg = (
         "You are a CSS and web design expert. "
         "You will receive a portion of a larger CSS file. "
@@ -81,12 +122,13 @@ def regenerate_css_chunk(client: OpenAI, chunk: str, theme_prompt: str, chunk_in
     )
     user_msg = (
         f"{theme_prompt}\n\n"
+        f"You MUST follow this style guide exactly so all chunks look consistent:\n{style_guide}\n\n"
         f"This is chunk {chunk_index + 1} of {total_chunks} from the full stylesheet. "
         f"Regenerate these CSS rules:\n\n{chunk}"
     )
     print(f"Processing chunk {chunk_index + 1}/{total_chunks} ({len(chunk)} chars)...")
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},
@@ -133,11 +175,21 @@ def lambda_handler(event, context):
             chunks = split_css_into_chunks(content)
             print(f"Split CSS into {len(chunks)} chunk(s) for processing")
 
-            # Process each chunk sequentially and collect results
-            regenerated_parts = []
-            for i, chunk in enumerate(chunks):
-                regenerated_chunk = regenerate_css_chunk(client, chunk, theme_prompt, i, len(chunks))
-                regenerated_parts.append(regenerated_chunk)
+            # generate a style guide once so all chunks stay visually consistent
+            style_guide = generate_style_guide(client, content, theme_prompt)
+
+            # process all chunks in parallel (I/O-bound — threads wait on OpenAI, not CPU)
+            results = {}
+            with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+                futures = {
+                    executor.submit(regenerate_css_chunk, client, chunk, theme_prompt, style_guide, i, len(chunks)): i
+                    for i, chunk in enumerate(chunks)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    results[idx] = future.result()
+            
+            regenerated_parts = [results[i] for i in range(len(chunks))]
 
             regenerated_css = "\n\n".join(regenerated_parts)
             print(f"Regenerated CSS total size: {len(regenerated_css)} characters")
