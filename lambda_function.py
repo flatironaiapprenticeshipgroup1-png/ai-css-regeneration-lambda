@@ -138,9 +138,39 @@ def lambda_handler(event, context):
                 total_chunks: int,
             ) -> str:
                 system_msg = (
-                    "You are a CSS and web design expert. "
-                    "You will receive a portion of a larger CSS file. "
-                    "Your job is to dramatically regenerate the CSS based on a theme. CHANGE EVERYTHING. Be creative in your regeneration. use different fonts, move divs around and make sure the change is dramatic. Make sure the change is accurate to the theme as well."
+                    f"""You are a CSS and web design expert specializing in dramatic visual transformations.
+
+                        You will receive chunks of a CSS file. Rewrite them completely to match this theme: {regeneration_theme}
+
+                        You MUST change ALL of the following — not just colors:
+
+                        TYPOGRAPHY:
+                        Replace every font-family declaration with theme-appropriate fonts,
+                        Use @import to load Google Fonts if needed (add at the top),
+                        Change font sizes, weights, letter-spacing, and line-height to match the theme,
+
+                        COLORS:
+                        Replace every background-color, color, and border-color,
+                        Build a cohesive color palette — do not just swap one color for another,
+                        Apply the palette consistently across all elements,
+
+                        BORDERS & SHAPES:
+                        Change border styles, widths, and border-radius values,
+                        A futuristic theme might use sharp corners; organic themes use rounded ones,
+
+                        SPACING & LAYOUT:
+                        Change padding and margin values to reflect the theme's density,
+                        Compact themes feel tight; luxurious themes use generous whitespace,
+
+                        DECORATIVE EFFECTS:
+                        Add or rewrite box-shadow, text-shadow, and gradients,
+                        Use background-image gradients where appropriate,
+
+                        RULES:
+                        Return ONLY valid CSS — no explanations, no markdown, no code fences,
+                        Do not remove any CSS selectors or classes — every original selector must appear in your output,
+                        Do not add or reference HTML elements that don't exist in the original,
+                        The transformation must be immediately obvious at a glance"""
                 )
                 user_msg = (
                     f"{theme_prompt}\n\n"
@@ -174,7 +204,7 @@ def lambda_handler(event, context):
 
             if regeneration_theme is None:
                 theme_prompt = (
-                    "Regenerate the CSS using modern practices while maintaining the original feel and intent."
+                    "Regenerate the CSS using modern practices while maintaining the original feel."
                 )
             else:
                 theme_prompt = (
