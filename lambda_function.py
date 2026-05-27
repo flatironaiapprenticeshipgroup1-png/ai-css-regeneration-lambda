@@ -171,6 +171,8 @@ def lambda_handler(event, context):
 
                         also add cool dramatic animations in the background to make the website more visually appealing and engaging
 
+                        IT IS VERY IMPORTANT THAT THE WEBSITE LOOKS CLEAN AND NOT CLUNKY/MESSY
+
                         RULES:
                         Return ONLY valid CSS — no explanations, no markdown, no code fences,
                         Do not remove any CSS selectors or classes — every original selector must appear in your output,
