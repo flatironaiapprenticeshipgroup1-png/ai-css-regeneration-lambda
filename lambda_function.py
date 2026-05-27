@@ -2,7 +2,7 @@ import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from status_publisher import publish_status_update
+from status_publisher import get_current_sequence, publish_status_update
 
 import boto3
 from openai import OpenAI
@@ -11,20 +11,6 @@ s3 = boto3.client("s3")
 secrets_client = boto3.client("secretsmanager")
 dynamodb = boto3.resource("dynamodb")
 MAX_CHARS_PER_CHUNK = 12_000
-seq = 5
-def publish(step, status, message, result_url=None, error=None):
-    seq += 1
-    publish_status_update(
-        website_id=website_id,
-        website_url=url,
-        phase="crawler",
-        step=step,
-        status=status,
-        message=message,
-        sequence=seq,
-        result_url=result_url,
-        error=error,
-    )
 
 def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
     blocks = []
@@ -127,44 +113,6 @@ def generate_style_guide(client: OpenAI, css: str, theme_prompt: str) -> str:
     return style_guide
 
 
-def regenerate_css_chunk(
-    client: OpenAI,
-    chunk: str,
-    theme_prompt: str,
-    style_guide: str,
-    chunk_index: int,
-    total_chunks: int,
-) -> str:
-    system_msg = (
-        "You are a CSS and web design expert. "
-        "You will receive a portion of a larger CSS file. "
-        "Regenerate ONLY the CSS rules provided — do not add new rules or remove existing ones. "
-        "Return valid CSS only, with no markdown fences, no explanations, and no extra text."
-    )
-    user_msg = (
-        f"{theme_prompt}\n\n"
-        f"You MUST follow this style guide exactly so all chunks look consistent:\n{style_guide}\n\n"
-        f"This is chunk {chunk_index + 1} of {total_chunks} from the full stylesheet. "
-        f"Regenerate these CSS rules:\n\n{chunk}"
-    )
-    print(f"Processing chunk {chunk_index + 1}/{total_chunks} ({len(chunk)} chars)...")
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        max_tokens=16384,
-    )
-
-    publish(
-        step=f"regenerating_css_chunks_completed",
-        status="processing",
-        message=f"Regenerated chunk {chunk_index + 1} of {total_chunks}"
-    )
-    return response.choices[0].message.content
-
-
 def lambda_handler(event, context):
     try:
         secret = json.loads(
@@ -181,6 +129,60 @@ def lambda_handler(event, context):
             regeneration_theme = body.get("RegenerationTheme")
             print(f"Regeneration theme: {regeneration_theme}")
 
+            seq = get_current_sequence(website_id, website_url)
+            def publish(step, status, message, result_url=None, error=None):
+                nonlocal seq 
+                seq += 1
+                publish_status_update(
+                    website_id=website_id,
+                    website_url=website_url,
+                    phase="crawler",
+                    step=step,
+                    status=status,
+                    message=message,
+                    sequence=seq,
+                    result_url=result_url,
+                    error=error,
+                )
+
+            def regenerate_css_chunk(
+                client: OpenAI,
+                chunk: str,
+                theme_prompt: str,
+                style_guide: str,
+                chunk_index: int,
+                total_chunks: int,
+            ) -> str:
+                system_msg = (
+                    "You are a CSS and web design expert. "
+                    "You will receive a portion of a larger CSS file. "
+                    "Regenerate ONLY the CSS rules provided — do not add new rules or remove existing ones. "
+                    "Return valid CSS only, with no markdown fences, no explanations, and no extra text."
+                )
+                user_msg = (
+                    f"{theme_prompt}\n\n"
+                    f"You MUST follow this style guide exactly so all chunks look consistent:\n{style_guide}\n\n"
+                    f"This is chunk {chunk_index + 1} of {total_chunks} from the full stylesheet. "
+                    f"Regenerate these CSS rules:\n\n{chunk}"
+                )
+                print(f"Processing chunk {chunk_index + 1}/{total_chunks} ({len(chunk)} chars)...")
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    max_tokens=16384,
+                )
+
+                publish(
+                    step=f"regenerating_css_chunks_completed",
+                    status="processing",
+                    message=f"Regenerated chunk {chunk_index + 1} of {total_chunks}"
+                )
+                return response.choices[0].message.content
+            
+            
             response = s3.get_object(
                 Bucket=os.environ["BUCKET_NAME"],
                 Key=f"{website_id}/original-styles.css",
