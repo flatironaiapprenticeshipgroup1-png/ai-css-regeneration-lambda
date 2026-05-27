@@ -77,3 +77,4 @@ def lambda_handler(event, context):
                 {"message": "An error occurred during regeneration", "error": str(e)}
             ),
         }
+    
