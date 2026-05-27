@@ -2,6 +2,7 @@ import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from status_publisher import publish_status_update
 
 import boto3
 from openai import OpenAI
@@ -10,7 +11,20 @@ s3 = boto3.client("s3")
 secrets_client = boto3.client("secretsmanager")
 dynamodb = boto3.resource("dynamodb")
 MAX_CHARS_PER_CHUNK = 12_000
-
+seq = 5
+def publish(step, status, message, result_url=None, error=None):
+    seq += 1
+    publish_status_update(
+        website_id=website_id,
+        website_url=url,
+        phase="crawler",
+        step=step,
+        status=status,
+        message=message,
+        sequence=seq,
+        result_url=result_url,
+        error=error,
+    )
 
 def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
     blocks = []
@@ -142,6 +156,12 @@ def regenerate_css_chunk(
         ],
         max_tokens=16384,
     )
+
+    publish(
+        step=f"regenerating_css_chunks_completed",
+        status="processing",
+        message=f"Regenerated chunk {chunk_index + 1} of {total_chunks}"
+    )
     return response.choices[0].message.content
 
 
@@ -180,14 +200,17 @@ def lambda_handler(event, context):
                 )
 
             # Split into chunks if the file is large
+            publish(step="chunking", status="processing", message="Compressing CSS into chunks for processing")
             chunks = split_css_into_chunks(content)
             print(f"Split CSS into {len(chunks)} chunk(s) for processing")
 
             # generate a style guide once so all chunks stay visually consistent
+            publish(step="creating_style_guide", status="processing", message="Generating style guide for regenerated website")
             style_guide = generate_style_guide(client, content, theme_prompt)
 
             # process all chunks in parallel (I/O-bound — threads wait on OpenAI, not CPU)
             results = {}
+            publish(step="regenerating_css", status="processing", message="Ai Regenerating Styling CSS for the website")
             with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
                 futures = {
                     executor.submit(regenerate_css_chunk, client, chunk, theme_prompt, style_guide, i, len(chunks)): i
@@ -220,6 +243,7 @@ def lambda_handler(event, context):
                 ExpressionAttributeValues={":status": "completed"},
             )
             print(f"DynamoDB status updated to completed for website ID {website_id}")
+            publish(step="Finalizing", status="completed", message="Finished Css Regeneration")
 
         return {
             "statusCode": 200,
