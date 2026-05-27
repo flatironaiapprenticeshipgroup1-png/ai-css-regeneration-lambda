@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from status_publisher import get_current_sequence, publish_status_update
 
@@ -73,45 +74,6 @@ def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> lis
     return chunks
 
 
-def generate_style_guide(client: OpenAI, css: str, theme_prompt: str) -> str:
-    sample = css[:40_000]
-    print("Generating style guide from CSS sample...")
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a CSS design-systems expert and creative director. "
-                    "Your job is to create a style guide that fully transforms a website's visual identity to match a given theme. "
-                    "The theme MUST be the dominant influence — every color, font, spacing, and decoration choice must reflect it. "
-                    "Do NOT preserve the original site's colors or fonts unless they happen to match the theme. "
-                    "Return ONLY valid JSON — no markdown fences, no extra text."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"THEME TO APPLY: {theme_prompt}\n\n"
-                    "You MUST design every value in the style guide to strongly reflect this theme. "
-                    "For example, if the theme is 'retro and pink', every color should be pink/retro-inspired, "
-                    "fonts should feel retro, borders and shadows should match a retro aesthetic, etc. "
-                    "Do NOT copy the original site's colors. Invent new values that fit the theme.\n\n"
-                    "Return a JSON style guide with these keys:\n"
-                    "primary_color, secondary_color, accent_color, background_color, text_color, "
-                    "font_family_body, font_family_heading, base_font_size, line_height, "
-                    "border_radius, spacing_unit, box_shadow, button_style, link_style, "
-                    "any_other_key_design_tokens.\n\n"
-                    "For button_style and link_style use nested JSON objects with relevant CSS properties.\n\n"
-                    f"Original CSS structure (for layout/selector reference only — ignore its colors/fonts):\n{sample}"
-                ),
-            },
-        ],
-    )
-    style_guide = response.choices[0].message.content
-    print(f"Style guide generated: {style_guide}")
-    return style_guide
-
 
 def lambda_handler(event, context):
     try:
@@ -129,10 +91,32 @@ def lambda_handler(event, context):
             regeneration_theme = body.get("RegenerationTheme")
             print(f"Regeneration theme: {regeneration_theme}")
 
+            # Idempotency guard: skip if another Lambda invocation already claimed this job.
+            # SQS delivers at-least-once, so the same message can arrive while a prior
+            # invocation is still running (visibility timeout expired) or after a crash.
+            table = dynamodb.Table(os.environ["DYNAMODB_TABLE_NAME"])
+            existing = table.get_item(
+                Key={"RegeneratedWebsiteId": website_id, "RegeneratedWebsiteUrl": website_url}
+            ).get("Item", {})
+            current_status = existing.get("RegenerationStatus")
+            if current_status in ("processing", "completed"):
+                print(f"Skipping duplicate invocation for {website_id}: status is already '{current_status}'")
+                continue
+
+            table.update_item(
+                Key={"RegeneratedWebsiteId": website_id, "RegeneratedWebsiteUrl": website_url},
+                UpdateExpression="SET RegenerationStatus = :s",
+                ExpressionAttributeValues={":s": "processing"},
+            )
+
             seq = get_current_sequence(website_id, website_url)
+            seq_lock = threading.Lock()
+
             def publish(step, status, message, result_url=None, error=None):
-                nonlocal seq 
-                seq += 1
+                nonlocal seq
+                with seq_lock:
+                    seq += 1
+                    current_seq = seq
                 publish_status_update(
                     website_id=website_id,
                     website_url=website_url,
@@ -140,7 +124,7 @@ def lambda_handler(event, context):
                     step=step,
                     status=status,
                     message=message,
-                    sequence=seq,
+                    sequence=current_seq,
                     result_url=result_url,
                     error=error,
                 )
@@ -149,7 +133,6 @@ def lambda_handler(event, context):
                 client: OpenAI,
                 chunk: str,
                 theme_prompt: str,
-                style_guide: str,
                 chunk_index: int,
                 total_chunks: int,
             ) -> str:
@@ -161,7 +144,6 @@ def lambda_handler(event, context):
                 )
                 user_msg = (
                     f"{theme_prompt}\n\n"
-                    f"You MUST follow this style guide exactly so all chunks look consistent:\n{style_guide}\n\n"
                     f"This is chunk {chunk_index + 1} of {total_chunks} from the full stylesheet. "
                     f"Regenerate these CSS rules:\n\n{chunk}"
                 )
@@ -206,16 +188,12 @@ def lambda_handler(event, context):
             chunks = split_css_into_chunks(content)
             print(f"Split CSS into {len(chunks)} chunk(s) for processing")
 
-            # generate a style guide once so all chunks stay visually consistent
-            publish(step="creating_style_guide", status="processing", message="Generating style guide for regenerated website")
-            style_guide = generate_style_guide(client, content, theme_prompt)
-
             # process all chunks in parallel (I/O-bound — threads wait on OpenAI, not CPU)
             results = {}
             publish(step="regenerating_css", status="processing", message="Ai Regenerating Styling CSS for the website")
             with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
                 futures = {
-                    executor.submit(regenerate_css_chunk, client, chunk, theme_prompt, style_guide, i, len(chunks)): i
+                    executor.submit(regenerate_css_chunk, client, chunk, theme_prompt, i, len(chunks)): i
                     for i, chunk in enumerate(chunks)
                 }
                 for future in as_completed(futures):
@@ -235,7 +213,6 @@ def lambda_handler(event, context):
             )
             print(f"Regenerated CSS saved to S3 for website ID {website_id}")
 
-            table = dynamodb.Table(os.environ["DYNAMODB_TABLE_NAME"])
             table.update_item(
                 Key={
                     "RegeneratedWebsiteId": website_id,
