@@ -12,19 +12,23 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.14"
 
       - name: Install dependencies into package directory
-        # ably added: status_publisher.py imports AblyRest at runtime
-        run: pip install boto3 openai ably --target ./package
+        run: |
+          pip install ably \
+            openai \
+            --target ./package \
+            --platform manylinux2014_x86_64 \
+            --python-version 3.14 \
+            --only-binary=:all:
 
       - name: Build zip
         run: |
           cd package
           zip -r ../lambda.zip .
           cd ..
-          # status_publisher.py added: it is imported by handler at runtime
-          zip lambda.zip handler.py status_publisher.py
+          zip lambda.zip status_publisher.py lambda_function.py
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:

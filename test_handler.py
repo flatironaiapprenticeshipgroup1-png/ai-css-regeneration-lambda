@@ -29,19 +29,32 @@ import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
-os.environ["BUCKET_NAME"] = "test-bucket"
-os.environ["SECRET_NAME"] = "test/openai-secret"
-os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+os.environ.setdefault("BUCKET_NAME", "test-bucket")
+os.environ.setdefault("SECRET_NAME", "test-secret")
+os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ["DYNAMODB_TABLE_NAME"] = "test-table"
 os.environ["ABLY_SECRET_NAME"] = "test/ably-secret"
 
-WEBSITE_ID = "abc-123"
-URL = "https://example.com"
-THEME = "dark"
+# boto3 and OpenAI are called at module level in handler.py, so we must patch
+# before importing — otherwise the real AWS/OpenAI calls fire on import.
+_mock_s3 = MagicMock()
+_mock_secrets = MagicMock()
+_mock_secrets.get_secret_value.return_value = {
+    "SecretString": json.dumps({"OpenAIAPIKey": "test-key"})
+}
+_mock_openai_client = MagicMock()
 
 
-def make_event(website_id=WEBSITE_ID, url=URL, theme=THEME):
-    """Return a minimal SQS event for the given regeneration request."""
+def _boto3_client_factory(service, **kwargs):
+    return _mock_s3 if service == "s3" else _mock_secrets
+
+
+with patch("boto3.client", side_effect=_boto3_client_factory), \
+     patch("openai.OpenAI", return_value=_mock_openai_client):
+    from lambda_function import lambda_handler
+
+
+def make_event(website_id="test-123", url="https://example.com", theme="cyberpunk"):
     return {
         "Records": [
             {
