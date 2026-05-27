@@ -6,6 +6,7 @@ from openai import OpenAI
 
 s3 = boto3.client("s3")
 secrets_client = boto3.client("secretsmanager")
+dynamodb = boto3.resource("dynamodb")
 
 
 def lambda_handler(event, context):
@@ -49,6 +50,16 @@ def lambda_handler(event, context):
                 ContentType="text/css",
             )
             print(f"Regenerated CSS saved to S3 for website ID {website_id}")
+            table = dynamodb.Table(os.environ["DYNAMODB_TABLE_NAME"])
+            table.update_item(
+                Key={
+                    "RegeneratedWebsiteId": website_id,
+                    "RegeneratedWebsiteUrl": website_url,
+                },
+                UpdateExpression="SET RegenerationStatus = :status",
+                ExpressionAttributeValues={":status": "completed"},
+            )
+            print(f"DynamoDB status updated to completed for website ID {website_id}")
         return {
             "statusCode": 200,
             "body": json.dumps(
