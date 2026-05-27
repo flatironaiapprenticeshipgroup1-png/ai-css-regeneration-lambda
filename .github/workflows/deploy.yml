@@ -12,17 +12,22 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.14"
 
       - name: Install dependencies into package directory
-        run: pip install boto3 openai --target ./package
+        run: |
+          pip install openai \
+            --target ./package \
+            --platform manylinux2014_x86_64 \
+            --python-version 3.14 \
+            --only-binary=:all:
 
       - name: Build zip
         run: |
           cd package
           zip -r ../lambda.zip .
           cd ..
-          zip lambda.zip handler.py
+          zip lambda.zip lambda_function.py
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
