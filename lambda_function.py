@@ -201,6 +201,11 @@ def lambda_handler(event, context):
                     status="ai_lambda_processing",
                     message=f"Regenerated chunk {chunk_index + 1} of {total_chunks}"
                 )
+
+                input_cost  = response.usage.prompt_tokens     / 1_000_000 * 2.50
+                output_cost = response.usage.completion_tokens / 1_000_000 * 10.00
+                total_cost  = input_cost + output_cost
+                print(f"Chunk {chunk_index + 1} costs: input ${input_cost:.6f} + output ${output_cost:.6f} = total ${total_cost:.6f}")
                 return response.choices[0].message.content
             
             
