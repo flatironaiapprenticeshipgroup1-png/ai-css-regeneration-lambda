@@ -1,7 +1,9 @@
 import json
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from status_publisher import get_current_sequence, publish_status_update
 
 import boto3
 from openai import OpenAI
@@ -9,8 +11,7 @@ from openai import OpenAI
 s3 = boto3.client("s3")
 secrets_client = boto3.client("secretsmanager")
 dynamodb = boto3.resource("dynamodb")
-MAX_CHARS_PER_CHUNK = 12_000
-
+MAX_CHARS_PER_CHUNK = 30_000
 
 def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
     blocks = []
@@ -73,77 +74,6 @@ def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> lis
     return chunks
 
 
-def generate_style_guide(client: OpenAI, css: str, theme_prompt: str) -> str:
-    sample = css[:40_000]
-    print("Generating style guide from CSS sample...")
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a CSS design-systems expert and creative director. "
-                    "Your job is to create a style guide that fully transforms a website's visual identity to match a given theme. "
-                    "The theme MUST be the dominant influence — every color, font, spacing, and decoration choice must reflect it. "
-                    "Do NOT preserve the original site's colors or fonts unless they happen to match the theme. "
-                    "Return ONLY valid JSON — no markdown fences, no extra text."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"THEME TO APPLY: {theme_prompt}\n\n"
-                    "You MUST design every value in the style guide to strongly reflect this theme. "
-                    "For example, if the theme is 'retro and pink', every color should be pink/retro-inspired, "
-                    "fonts should feel retro, borders and shadows should match a retro aesthetic, etc. "
-                    "Do NOT copy the original site's colors. Invent new values that fit the theme.\n\n"
-                    "Return a JSON style guide with these keys:\n"
-                    "primary_color, secondary_color, accent_color, background_color, text_color, "
-                    "font_family_body, font_family_heading, base_font_size, line_height, "
-                    "border_radius, spacing_unit, box_shadow, button_style, link_style, "
-                    "any_other_key_design_tokens.\n\n"
-                    "For button_style and link_style use nested JSON objects with relevant CSS properties.\n\n"
-                    f"Original CSS structure (for layout/selector reference only — ignore its colors/fonts):\n{sample}"
-                ),
-            },
-        ],
-    )
-    style_guide = response.choices[0].message.content
-    print(f"Style guide generated: {style_guide}")
-    return style_guide
-
-
-def regenerate_css_chunk(
-    client: OpenAI,
-    chunk: str,
-    theme_prompt: str,
-    style_guide: str,
-    chunk_index: int,
-    total_chunks: int,
-) -> str:
-    system_msg = (
-        "You are a CSS and web design expert. "
-        "You will receive a portion of a larger CSS file. "
-        "Regenerate ONLY the CSS rules provided — do not add new rules or remove existing ones. "
-        "Return valid CSS only, with no markdown fences, no explanations, and no extra text."
-    )
-    user_msg = (
-        f"{theme_prompt}\n\n"
-        f"You MUST follow this style guide exactly so all chunks look consistent:\n{style_guide}\n\n"
-        f"This is chunk {chunk_index + 1} of {total_chunks} from the full stylesheet. "
-        f"Regenerate these CSS rules:\n\n{chunk}"
-    )
-    print(f"Processing chunk {chunk_index + 1}/{total_chunks} ({len(chunk)} chars)...")
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        max_tokens=16384,
-    )
-    return response.choices[0].message.content
-
 
 def lambda_handler(event, context):
     try:
@@ -161,6 +91,117 @@ def lambda_handler(event, context):
             regeneration_theme = body.get("RegenerationTheme")
             print(f"Regeneration theme: {regeneration_theme}")
 
+            # Idempotency guard: skip if another Lambda invocation already claimed this job.
+            # SQS delivers at-least-once, so the same message can arrive while a prior
+            # invocation is still running (visibility timeout expired) or after a crash.
+            table = dynamodb.Table(os.environ["DYNAMODB_TABLE_NAME"])
+            existing = table.get_item(
+                Key={"RegeneratedWebsiteId": website_id, "RegeneratedWebsiteUrl": website_url}
+            ).get("Item", {})
+            current_status = existing.get("RegenerationStatus")
+            if current_status in ("ai_lambda_processing", "completed"):
+                print(f"Skipping duplicate invocation for {website_id}: status is already '{current_status}'")
+                publish(step="Finalizing", status="completed", message="Finished Css Regeneration")
+                continue
+
+            table.update_item(
+                Key={"RegeneratedWebsiteId": website_id, "RegeneratedWebsiteUrl": website_url},
+                UpdateExpression="SET RegenerationStatus = :s",
+                ExpressionAttributeValues={":s": "processing"},
+            )
+
+            seq = get_current_sequence(website_id, website_url)
+            seq_lock = threading.Lock()
+
+            def publish(step, status, message, result_url=None, error=None):
+                nonlocal seq
+                with seq_lock:
+                    seq += 1
+                    current_seq = seq
+                publish_status_update(
+                    website_id=website_id,
+                    website_url=website_url,
+                    phase="crawler",
+                    step=step,
+                    status=status,
+                    message=message,
+                    sequence=current_seq,
+                    result_url=result_url,
+                    error=error,
+                )
+
+            def regenerate_css_chunk(
+                client: OpenAI,
+                chunk: str,
+                theme_prompt: str,
+                chunk_index: int,
+                total_chunks: int,
+            ) -> str:
+                system_msg = (
+                    f"""You are a CSS and web design expert specializing in dramatic visual transformations.
+
+                        You will receive chunks of a CSS file. Rewrite them completely to match this theme: {regeneration_theme}
+
+                        You MUST change ALL of the following — not just colors:
+
+                        TYPOGRAPHY:
+                        Replace every font-family declaration with theme-appropriate fonts,
+                        Use @import to load Google Fonts if needed (add at the top),
+                        Change font sizes, weights, letter-spacing, and line-height to match the theme,
+
+                        COLORS:
+                        Replace every background-color, color, and border-color,
+                        Build a cohesive color palette — do not just swap one color for another,
+                        Apply the palette consistently across all elements,
+
+                        BORDERS & SHAPES:
+                        Change border styles, widths, and border-radius values,
+                        A futuristic theme might use sharp corners; organic themes use rounded ones,
+
+                        SPACING & LAYOUT:
+                        Change padding and margin values to reflect the theme's density,
+                        Compact themes feel tight; luxurious themes use generous whitespace,
+
+                        DECORATIVE EFFECTS:
+                        Add or rewrite box-shadow, text-shadow, and gradients,
+                        Use background-image gradients where appropriate,
+
+                        ANIMATIONS:
+                        Add animations like hover effects or keyframe animations that fit the theme
+
+                        also add cool dramatic animations in the background to make the website more visually appealing and engaging
+
+                        IT IS VERY IMPORTANT THAT THE WEBSITE LOOKS CLEAN AND NOT CLUNKY/MESSY
+
+                        RULES:
+                        Return ONLY valid CSS — no explanations, no markdown, no code fences,
+                        Do not remove any CSS selectors or classes — every original selector must appear in your output,
+                        Do not add or reference HTML elements that don't exist in the original,
+                        The transformation must be immediately obvious at a glance"""
+                )
+                user_msg = (
+                    f"{theme_prompt}\n\n"
+                    f"This is chunk {chunk_index + 1} of {total_chunks} from the full stylesheet. "
+                    f"Regenerate this css: {chunk}"
+                )
+                print(f"Processing chunk {chunk_index + 1}/{total_chunks} ({len(chunk)} chars)...")
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    max_tokens=16384,
+                )
+
+                publish(
+                    step=f"regenerating_css_chunks_completed",
+                    status="ai_lambda_processing",
+                    message=f"Regenerated chunk {chunk_index + 1} of {total_chunks}"
+                )
+                return response.choices[0].message.content
+            
+            
             response = s3.get_object(
                 Bucket=os.environ["BUCKET_NAME"],
                 Key=f"{website_id}/original-styles.css",
@@ -170,27 +211,24 @@ def lambda_handler(event, context):
 
             if regeneration_theme is None:
                 theme_prompt = (
-                    "No specific theme provided. Regenerate the CSS using modern practices "
-                    "while maintaining the original feel and intent."
+                    "Regenerate the CSS using modern practices while maintaining the original feel."
                 )
             else:
                 theme_prompt = (
-                    f"Regenerate the CSS using the theme: {regeneration_theme}. "
-                    "Ensure the CSS follows modern practices."
+                    f"Regenerate the CSS using the theme: {regeneration_theme}."
                 )
 
             # Split into chunks if the file is large
+            publish(step="chunking", status="ai_lambda_processing", message="Compressing CSS into chunks for processing")
             chunks = split_css_into_chunks(content)
             print(f"Split CSS into {len(chunks)} chunk(s) for processing")
 
-            # generate a style guide once so all chunks stay visually consistent
-            style_guide = generate_style_guide(client, content, theme_prompt)
-
             # process all chunks in parallel (I/O-bound — threads wait on OpenAI, not CPU)
             results = {}
+            publish(step="regenerating_css", status="ai_lambda_processing", message="Ai Regenerating Styling CSS for the website")
             with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
                 futures = {
-                    executor.submit(regenerate_css_chunk, client, chunk, theme_prompt, style_guide, i, len(chunks)): i
+                    executor.submit(regenerate_css_chunk, client, chunk, theme_prompt, i, len(chunks)): i
                     for i, chunk in enumerate(chunks)
                 }
                 for future in as_completed(futures):
@@ -207,10 +245,10 @@ def lambda_handler(event, context):
                 Key=f"{website_id}/Regenerated-Styles.css",
                 Body=regenerated_css.encode("utf-8"),
                 ContentType="text/css",
+                CacheControl="no-store, no-cache, must-revalidate",
             )
             print(f"Regenerated CSS saved to S3 for website ID {website_id}")
 
-            table = dynamodb.Table(os.environ["DYNAMODB_TABLE_NAME"])
             table.update_item(
                 Key={
                     "RegeneratedWebsiteId": website_id,
@@ -220,6 +258,7 @@ def lambda_handler(event, context):
                 ExpressionAttributeValues={":status": "completed"},
             )
             print(f"DynamoDB status updated to completed for website ID {website_id}")
+            publish(step="Finalizing", status="completed", message="Finished Css Regeneration")
 
         return {
             "statusCode": 200,
