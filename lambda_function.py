@@ -81,6 +81,7 @@ def lambda_handler(event, context):
             secrets_client.get_secret_value(SecretId=os.environ["SECRET_NAME"])["SecretString"]
         )
         client = OpenAI(api_key=secret["OpenAIAPIKey"])
+        print(secret["OpenAIAPIKey"])
 
         for record in event["Records"]:
             body = json.loads(record["body"])
