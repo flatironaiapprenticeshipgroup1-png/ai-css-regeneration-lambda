@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import threading
@@ -6,7 +7,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from status_publisher import get_current_sequence, publish_status_update
 
 import boto3
+import openai
 from openai import OpenAI
+
+logging.getLogger().setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
 s3 = boto3.client("s3")
 secrets_client = boto3.client("secretsmanager")
@@ -85,11 +90,11 @@ def lambda_handler(event, context):
         for record in event["Records"]:
             body = json.loads(record["body"])
             website_id = body["RegeneratedWebsiteId"]
-            print(f"Received regeneration request for website ID: {website_id}")
+            logger.info("Received regeneration request for website ID: %s", website_id)
             website_url = body["RegeneratedWebsiteUrl"]
-            print(f"Website URL: {website_url}")
+            logger.info("Website URL: %s", website_url)
             regeneration_theme = body.get("RegenerationTheme")
-            print(f"Regeneration theme: {regeneration_theme}")
+            logger.info("Regeneration theme: %s", regeneration_theme)
 
             # Idempotency guard: skip if another Lambda invocation already claimed this job.
             # SQS delivers at-least-once, so the same message can arrive while a prior
@@ -100,7 +105,7 @@ def lambda_handler(event, context):
             ).get("Item", {})
             current_status = existing.get("RegenerationStatus")
             if current_status in ("ai_lambda_processing", "completed"):
-                print(f"Skipping duplicate invocation for {website_id}: status is already '{current_status}'")
+                logger.warning("Skipping duplicate invocation for %s: status is already '%s'", website_id, current_status)
                 publish(step="Finalizing", status="completed", message="Finished Css Regeneration")
                 continue
 
@@ -184,26 +189,67 @@ def lambda_handler(event, context):
                     f"This is chunk {chunk_index + 1} of {total_chunks} from the full stylesheet. "
                     f"Regenerate this css: {chunk}"
                 )
-                print(f"Processing chunk {chunk_index + 1}/{total_chunks} ({len(chunk)} chars)...")
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    max_tokens=16384,
+                logger.info(
+                    "[OpenAI] Sending chunk %d/%d to gpt-4o | input_chars=%d | max_tokens=16384",
+                    chunk_index + 1, total_chunks, len(chunk),
                 )
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                            {"role": "system", "content": system_msg},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        max_tokens=16384,
+                    )
+                except openai.RateLimitError:
+                    logger.error(
+                        "[OpenAI] Rate limit hit on chunk %d/%d — request rejected by OpenAI",
+                        chunk_index + 1, total_chunks, exc_info=True,
+                    )
+                    raise
+                except openai.APITimeoutError:
+                    logger.error(
+                        "[OpenAI] Request timed out on chunk %d/%d",
+                        chunk_index + 1, total_chunks, exc_info=True,
+                    )
+                    raise
+                except openai.APIStatusError as e:
+                    logger.error(
+                        "[OpenAI] API error on chunk %d/%d | status=%s | message=%s",
+                        chunk_index + 1, total_chunks, e.status_code, e.message, exc_info=True,
+                    )
+                    raise
+                except openai.APIError:
+                    logger.error(
+                        "[OpenAI] Unexpected API error on chunk %d/%d",
+                        chunk_index + 1, total_chunks, exc_info=True,
+                    )
+                    raise
+
+                finish_reason = response.choices[0].finish_reason
+                prompt_tokens = response.usage.prompt_tokens
+                completion_tokens = response.usage.completion_tokens
+                input_cost  = prompt_tokens     / 1_000_000 * 2.50
+                output_cost = completion_tokens / 1_000_000 * 10.00
+                total_cost  = input_cost + output_cost
+
+                logger.info(
+                    "[OpenAI] Chunk %d/%d complete | finish_reason=%s | prompt_tokens=%d | completion_tokens=%d | cost=$%.6f",
+                    chunk_index + 1, total_chunks, finish_reason, prompt_tokens, completion_tokens, total_cost,
+                )
+                if finish_reason != "stop":
+                    logger.warning(
+                        "[OpenAI] Chunk %d/%d finish_reason='%s' — output may be truncated or incomplete",
+                        chunk_index + 1, total_chunks, finish_reason,
+                    )
 
                 publish(
-                    step=f"regenerating_css_chunks_completed",
+                    step="regenerating_css_chunks_completed",
                     status="ai_lambda_processing",
                     message=f"Regenerated chunk {chunk_index + 1} of {total_chunks}"
                 )
 
-                input_cost  = response.usage.prompt_tokens     / 1_000_000 * 2.50
-                output_cost = response.usage.completion_tokens / 1_000_000 * 10.00
-                total_cost  = input_cost + output_cost
-                print(f"Chunk {chunk_index + 1} costs: input ${input_cost:.6f} + output ${output_cost:.6f} = total ${total_cost:.6f}")
                 return response.choices[0].message.content
             
             
@@ -212,7 +258,7 @@ def lambda_handler(event, context):
                 Key=f"{website_id}/original-styles.css",
             )
             content = response["Body"].read().decode("utf-8")
-            print(f"CSS file size: {len(content)} characters")
+            logger.info("CSS file size: %d characters", len(content))
 
             if regeneration_theme is None:
                 theme_prompt = (
@@ -226,7 +272,7 @@ def lambda_handler(event, context):
             # Split into chunks if the file is large
             publish(step="chunking", status="ai_lambda_processing", message="Compressing CSS into chunks for processing")
             chunks = split_css_into_chunks(content)
-            print(f"Split CSS into {len(chunks)} chunk(s) for processing")
+            logger.info("Split CSS into %d chunk(s) for processing", len(chunks))
 
             # process all chunks in parallel (I/O-bound — threads wait on OpenAI, not CPU)
             results = {}
@@ -238,12 +284,19 @@ def lambda_handler(event, context):
                 }
                 for future in as_completed(futures):
                     idx = futures[future]
-                    results[idx] = future.result()
+                    try:
+                        results[idx] = future.result()
+                    except Exception:
+                        logger.error(
+                            "[OpenAI] Chunk %d/%d failed — aborting regeneration",
+                            idx + 1, len(chunks), exc_info=True,
+                        )
+                        raise
             
             regenerated_parts = [results[i] for i in range(len(chunks))]
 
             regenerated_css = "\n\n".join(regenerated_parts)
-            print(f"Regenerated CSS total size: {len(regenerated_css)} characters")
+            logger.info("Regenerated CSS total size: %d characters", len(regenerated_css))
 
             s3.put_object(
                 Bucket=os.environ["BUCKET_NAME"],
@@ -252,7 +305,7 @@ def lambda_handler(event, context):
                 ContentType="text/css",
                 CacheControl="no-store, no-cache, must-revalidate",
             )
-            print(f"Regenerated CSS saved to S3 for website ID {website_id}")
+            logger.info("Regenerated CSS saved to S3 for website ID %s", website_id)
 
             table.update_item(
                 Key={
@@ -262,7 +315,7 @@ def lambda_handler(event, context):
                 UpdateExpression="SET RegenerationStatus = :status",
                 ExpressionAttributeValues={":status": "completed"},
             )
-            print(f"DynamoDB status updated to completed for website ID {website_id}")
+            logger.info("DynamoDB status updated to completed for website ID %s", website_id)
             publish(step="Finalizing", status="completed", message="Finished Css Regeneration")
 
         return {
@@ -275,7 +328,7 @@ def lambda_handler(event, context):
             ),
         }
     except Exception as e:
-        print(f"Error processing regeneration request: {e}")
+        logger.error("Error processing regeneration request", exc_info=True)
         return {
             "statusCode": 500,
             "body": json.dumps(
