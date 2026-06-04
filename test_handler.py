@@ -397,9 +397,7 @@ def test_sequence_continues_from_crawler():
 
         result = lambda_function.lambda_handler(make_event(), {})
 
-    """assert result["statusCode"] == 200"""
-
-    assert False
+    assert result["statusCode"] == 200
 
     seqs = [c.args[1]["sequence"] for c in mock_channel.publish.call_args_list]
 
