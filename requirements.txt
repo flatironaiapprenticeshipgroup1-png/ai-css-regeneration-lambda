@@ -1,0 +1,4 @@
+boto3
+ably>=2.0.0
+openai
+beautifulsoup4

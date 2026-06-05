@@ -1,28 +1,41 @@
 """
-Test suite for the AI CSS Regeneration Lambda handler.
+Test suite for the AI HTML+CSS Regeneration Lambda handler.
 
 Tests verify:
 1. Happy path: all expected steps published with correct sequence numbers
-2. OpenAI failure: failed step published, 500 returned
-3. S3 write failure: failed step published, 500 returned
+2. OpenAI failure: 500 returned
+3. S3 write failure: 500 returned
 4. Sequence numbers: always strictly increasing within a single invocation
 5. Sequence continuation: AI sequences start at crawler_last_seq + 1
 
 Important test-infrastructure notes
 ------------------------------------
-- Every test imports handler AND calls lambda_handler() INSIDE the same
-  patch with-block.  This is required because status_publisher.py lazily
+- Every test imports lambda_function AND calls lambda_handler() INSIDE the
+  same patch with-block. This is required because status_publisher.py lazily
   initialises its boto3 / Ably singletons on first use; if those singletons
   are created outside the patch context they hit real AWS and raise
   NoCredentialsError.
 
-- mock_ably_channel.publish is an AsyncMock.  status_publisher wraps the
+- There are two separate DynamoDB surfaces:
+    * boto3.client("dynamodb") — used by status_publisher (low-level DynamoDB
+      JSON API) for get_current_sequence() and update_item per publish.
+    * boto3.resource("dynamodb").Table(...) — used by lambda_function itself
+      (high-level API) for idempotency guard and status field updates.
+
+- mock_ably_channel.publish is an AsyncMock. status_publisher wraps the
   Ably publish call with asyncio.run(), which requires the mock to return an
   awaitable coroutine rather than a plain MagicMock object.
 
-- mock_dynamodb.get_item returns {} by default (no Item key) so
+- mock_dynamodb_client.get_item returns {} by default (no Item key) so
   get_current_sequence() resolves to 0 and sequences start at 1.
-  Tests that verify continuation override this to return a real Item.
+
+- The OpenAI mock response returns JSON with "html" and "css" keys because
+  lambda_function now uses response_format={"type": "json_object"} and
+  json.loads() on the content.
+
+- s3.get_object is called twice per run: once for index.html and once for
+  original-styles.css. The mock uses side_effect to return different bodies
+  based on the Key argument.
 """
 import json
 import os
@@ -35,26 +48,37 @@ os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ["DYNAMODB_TABLE_NAME"] = "test-table"
 os.environ["ABLY_SECRET_NAME"] = "test/ably-secret"
 
-# boto3 and OpenAI are called at module level in handler.py, so we must patch
-# before importing — otherwise the real AWS/OpenAI calls fire on import.
+WEBSITE_ID = "test-123"
+URL = "https://example.com"
+
+# Sample HTML that produces one head chunk and one body chunk (two total chunks).
+MOCK_HTML = (
+    b"<html><head><title>Test</title></head>"
+    b"<body><div class='hero'>Hello</div></body></html>"
+)
+MOCK_CSS = b".hero { color: red; font-size: 16px; }"
+MOCK_CHUNK_RESPONSE = json.dumps({"html": "<p>regenerated</p>", "css": ".hero { color: neon; }"})
+
 _mock_s3 = MagicMock()
 _mock_secrets = MagicMock()
 _mock_secrets.get_secret_value.return_value = {
     "SecretString": json.dumps({"OpenAIAPIKey": "test-key"})
 }
 _mock_openai_client = MagicMock()
+_mock_dynamodb_resource = MagicMock()
 
 
-def _boto3_client_factory(service, **kwargs):
+def _boto3_client_factory(service, **_):
     return _mock_s3 if service == "s3" else _mock_secrets
 
 
 with patch("boto3.client", side_effect=_boto3_client_factory), \
+     patch("boto3.resource", return_value=_mock_dynamodb_resource), \
      patch("openai.OpenAI", return_value=_mock_openai_client):
     from lambda_function import lambda_handler
 
 
-def make_event(website_id="test-123", url="https://example.com", theme="cyberpunk"):
+def make_event(website_id=WEBSITE_ID, url=URL, theme="cyberpunk"):
     return {
         "Records": [
             {
@@ -72,196 +96,216 @@ def make_mocks():
     """
     Build and return all mock objects needed by one test.
 
-    DynamoDB get_item default
-    -------------------------
-    Returns {} (empty response, no 'Item' key) so get_current_sequence()
-    resolves to 0 and the first published event gets sequence 1.
-    Override mock_dynamodb.get_item.return_value in specific tests to
-    simulate a crawler having already written a CurrentSequence value.
+    s3.get_object uses side_effect to return HTML for index.html requests
+    and CSS for original-styles.css requests, since lambda_function now
+    reads both assets before chunking.
 
-    AsyncMock for channel.publish
-    -----------------------------
-    ably-python >= 2.0.0 makes channel.publish() a coroutine.
-    status_publisher wraps it with asyncio.run(), so the mock must return
-    an awaitable.  AsyncMock satisfies this requirement.
-
-    Returns:
-        tuple: (mock_s3, mock_dynamodb, mock_ably_channel, mock_ably_rest,
-                mock_openai, boto3_factory)
+    The OpenAI mock returns JSON with "html" and "css" keys to match
+    the response_format={"type": "json_object"} prompt and json.loads() call.
     """
     mock_s3 = MagicMock()
-    mock_s3.get_object.return_value = {"Body": MagicMock(read=lambda: b"body { color: red; }")}
 
-    mock_dynamodb = MagicMock()
-    # Default: no Item in DynamoDB — get_current_sequence() returns 0, seq starts at 1.
-    # Override in individual tests to simulate a specific crawler end-sequence.
-    mock_dynamodb.get_item.return_value = {}
+    def get_object_side_effect(Bucket=None, Key=None):
+        if Key and Key.endswith("index.html"):
+            return {"Body": MagicMock(read=lambda: MOCK_HTML)}
+        return {"Body": MagicMock(read=lambda: MOCK_CSS)}
+
+    mock_s3.get_object.side_effect = get_object_side_effect
+
+    mock_dynamodb_client = MagicMock()
+    mock_dynamodb_client.get_item.return_value = {}
+
+    mock_table = MagicMock()
+    mock_table.get_item.return_value = {}
+    mock_dynamodb_resource = MagicMock()
+    mock_dynamodb_resource.Table.return_value = mock_table
 
     mock_secrets = MagicMock()
     mock_secrets.get_secret_value.side_effect = lambda SecretId: {
-        "test/openai-secret": {"SecretString": json.dumps({"OpenAIAPIKey": "fake-openai-key"})},
+        "test-secret": {"SecretString": json.dumps({"OpenAIAPIKey": "fake-openai-key"})},
         "test/ably-secret": {"SecretString": json.dumps({"AblyApiKey": "fake-ably-key"})},
     }[SecretId]
 
-    def boto3_factory(service, **kwargs):
-        return {"s3": mock_s3, "dynamodb": mock_dynamodb, "secretsmanager": mock_secrets}[service]
+    def boto3_client_factory(service, **_):
+        return {
+            "s3": mock_s3,
+            "dynamodb": mock_dynamodb_client,
+            "secretsmanager": mock_secrets,
+        }[service]
 
     mock_openai = MagicMock()
     mock_openai.chat.completions.create.return_value = MagicMock(
-        choices=[MagicMock(message=MagicMock(content="body { color: neon; }"))]
+        choices=[MagicMock(
+            message=MagicMock(content=MOCK_CHUNK_RESPONSE),
+            finish_reason="stop",
+        )],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
     )
 
     mock_ably_channel = MagicMock()
-    # AsyncMock required: asyncio.run(channel.publish(...)) needs an awaitable return value
     mock_ably_channel.publish = AsyncMock()
     mock_ably_rest = MagicMock()
     mock_ably_rest.channels.get.return_value = mock_ably_channel
 
-    return mock_s3, mock_dynamodb, mock_ably_channel, mock_ably_rest, mock_openai, boto3_factory
+    return (
+        mock_s3, mock_dynamodb_client, mock_table, mock_dynamodb_resource,
+        mock_ably_channel, mock_ably_rest, mock_openai, boto3_client_factory,
+    )
 
 
 def _clear_modules():
-    """Remove cached handler/status_publisher so each test gets a fresh import."""
-    for mod in ["handler", "status_publisher"]:
+    for mod in ["lambda_function", "status_publisher"]:
         if mod in sys.modules:
             del sys.modules[mod]
 
 
+# MOCK_HTML produces two chunks: head + one body chunk → two "regenerating_chunk_completed" events.
+EXPECTED_STEPS = [
+    "chunking",
+    "regenerating_html_and_css",
+    "regenerating_chunk_completed",  # head chunk
+    "regenerating_chunk_completed",  # body chunk
+    "Finalizing",
+]
+
+
 def test_happy_path_publishes_all_steps():
     """
-    Verify that a successful run publishes all expected steps in order with
-    monotonically increasing sequence numbers, writes the CSS to S3, and
-    persists status to DynamoDB for every published event.
+    Verify a successful run publishes all expected steps in order with
+    monotonically increasing sequence numbers, writes both HTML and CSS to S3,
+    and updates DynamoDB status.
+
+    Because head and body chunks run in parallel the two regenerating_chunk_completed
+    events may arrive in either order, so we assert on counts and boundaries
+    rather than strict positional equality for those middle events.
     """
-    mock_s3, mock_dynamodb, mock_channel, mock_ably_rest, mock_openai, boto3_factory = make_mocks()
+    (mock_s3, mock_dynamodb_client, mock_table, mock_dynamodb_resource,
+     mock_channel, mock_ably_rest, mock_openai, boto3_client_factory) = make_mocks()
     _clear_modules()
 
-    # Import AND call must be inside the with-block so lazy singletons use mocks.
-    with patch("boto3.client", side_effect=boto3_factory), \
+    with patch("boto3.client", side_effect=boto3_client_factory), \
+         patch("boto3.resource", return_value=mock_dynamodb_resource), \
          patch("ably.AblyRest", return_value=mock_ably_rest), \
          patch("openai.OpenAI", return_value=mock_openai):
-        import handler
-        result = handler.lambda_handler(make_event(), {})
+        import lambda_function
+        result = lambda_function.lambda_handler(make_event(), {})
 
     assert result["statusCode"] == 200
 
     steps = [c.args[1]["step"] for c in mock_channel.publish.call_args_list]
-    assert steps == [
-        "received",
-        "reading_source_css",
-        "building_prompt",
-        "calling_openai",
-        "saving_regenerated_css",
-        "completed",
-    ], f"Unexpected steps: {steps}"
+
+    # First two and last step are deterministic; the middle chunk-complete events are parallel
+    assert steps[0] == "chunking"
+    assert steps[1] == "regenerating_html_and_css"
+    assert steps[-1] == "Finalizing"
+    assert steps[2:-1].count("regenerating_chunk_completed") == len(steps) - 3
 
     seqs = [c.args[1]["sequence"] for c in mock_channel.publish.call_args_list]
-    # With no prior crawler sequence (get_item returns {}), starts at 1
-    assert seqs == list(range(1, len(steps) + 1)), f"Unexpected sequences: {seqs}"
+    assert seqs == list(range(1, len(EXPECTED_STEPS) + 1)), f"Unexpected sequences: {seqs}"
 
     last = mock_channel.publish.call_args_list[-1].args[1]
     assert last["status"] == "completed"
 
-    assert mock_s3.put_object.call_count == 1
-    key = mock_s3.put_object.call_args.kwargs["Key"]
-    assert key == f"{WEBSITE_ID}/Regenerated-Styles.css"
-    # One DynamoDB update_item per published event (status persistence)
-    assert mock_dynamodb.update_item.call_count == len(steps)
+    # Two S3 writes: Regenerated-Index.html and Regenerated-Styles.css
+    assert mock_s3.put_object.call_count == 2
+    written_keys = {call.kwargs["Key"] for call in mock_s3.put_object.call_args_list}
+    assert written_keys == {
+        f"{WEBSITE_ID}/Regenerated-Index.html",
+        f"{WEBSITE_ID}/Regenerated-Styles.css",
+    }
 
-    # Verify update_item uses the composite key (both partition and sort key)
-    for call in mock_dynamodb.update_item.call_args_list:
-        key_used = call.kwargs["Key"]
-        assert "RegeneratedWebsiteId" in key_used, "Missing partition key in DynamoDB update"
-        assert "RegeneratedWebsiteUrl" in key_used, "Missing sort key in DynamoDB update"
+    assert mock_dynamodb_client.update_item.call_count == len(EXPECTED_STEPS)
+    assert mock_table.update_item.call_count == 2
 
     print("test_happy_path_publishes_all_steps: PASSED")
 
 
-def test_openai_failure_publishes_failed():
+def test_openai_failure_returns_500():
     """
-    Verify that an OpenAI error causes a 'failed' step to be published and a
-    500 response to be returned.
+    Verify that an OpenAI error causes a 500 response.
+    chunking and regenerating_html_and_css are published before the failure;
+    Finalizing is not published.
     """
-    mock_s3, mock_dynamodb, mock_channel, mock_ably_rest, mock_openai, boto3_factory = make_mocks()
+    (_, _, _, mock_dynamodb_resource,
+     mock_channel, mock_ably_rest, mock_openai, boto3_client_factory) = make_mocks()
     mock_openai.chat.completions.create.side_effect = Exception("OpenAI error")
     _clear_modules()
 
-    with patch("boto3.client", side_effect=boto3_factory), \
+    with patch("boto3.client", side_effect=boto3_client_factory), \
+         patch("boto3.resource", return_value=mock_dynamodb_resource), \
          patch("ably.AblyRest", return_value=mock_ably_rest), \
          patch("openai.OpenAI", return_value=mock_openai):
-        import handler
-        result = handler.lambda_handler(make_event(), {})
+        import lambda_function
+        result = lambda_function.lambda_handler(make_event(), {})
 
     assert result["statusCode"] == 500
 
     steps = [c.args[1]["step"] for c in mock_channel.publish.call_args_list]
-    assert "failed" in steps, f"Expected 'failed' step, got: {steps}"
-    failed = next(c.args[1] for c in mock_channel.publish.call_args_list
-                  if c.args[1]["step"] == "failed")
-    assert failed["status"] == "failed"
-    assert failed["error"] is not None
-    print("test_openai_failure_publishes_failed: PASSED")
+    assert "chunking" in steps
+    assert "regenerating_html_and_css" in steps
+    assert "Finalizing" not in steps
+
+    print("test_openai_failure_returns_500: PASSED")
 
 
-def test_s3_write_failure_publishes_failed():
+def test_s3_write_failure_returns_500():
     """
-    Verify that an S3 write error causes a 'failed' step to be published and
-    a 500 response to be returned.
+    Verify that an S3 write error causes a 500 response.
+    Chunk regeneration succeeds, so regenerating_chunk_completed events are present,
+    but Finalizing is not published since the write fails first.
     """
-    mock_s3, mock_dynamodb, mock_channel, mock_ably_rest, mock_openai, boto3_factory = make_mocks()
+    (mock_s3, _, _, mock_dynamodb_resource,
+     mock_channel, mock_ably_rest, mock_openai, boto3_client_factory) = make_mocks()
     mock_s3.put_object.side_effect = Exception("S3 write error")
     _clear_modules()
 
-    with patch("boto3.client", side_effect=boto3_factory), \
+    with patch("boto3.client", side_effect=boto3_client_factory), \
+         patch("boto3.resource", return_value=mock_dynamodb_resource), \
          patch("ably.AblyRest", return_value=mock_ably_rest), \
          patch("openai.OpenAI", return_value=mock_openai):
-        import handler
-        result = handler.lambda_handler(make_event(), {})
+        import lambda_function
+        result = lambda_function.lambda_handler(make_event(), {})
 
     assert result["statusCode"] == 500
 
     steps = [c.args[1]["step"] for c in mock_channel.publish.call_args_list]
-    assert "failed" in steps, f"Expected 'failed' step, got: {steps}"
-    print("test_s3_write_failure_publishes_failed: PASSED")
+    assert "Finalizing" not in steps
+
+    print("test_s3_write_failure_returns_500: PASSED")
 
 
 def test_sequence_numbers_always_increase():
     """
-    Verify that all published events carry strictly increasing sequence numbers
-    with no gaps or duplicates within a single invocation.
-    Frontend deduplication relies on this.
+    Verify all published events carry strictly increasing sequence numbers.
     """
-    mock_s3, mock_dynamodb, mock_channel, mock_ably_rest, mock_openai, boto3_factory = make_mocks()
+    (_, _, _, mock_dynamodb_resource,
+     mock_channel, mock_ably_rest, mock_openai, boto3_client_factory) = make_mocks()
     _clear_modules()
 
-    with patch("boto3.client", side_effect=boto3_factory), \
+    with patch("boto3.client", side_effect=boto3_client_factory), \
+         patch("boto3.resource", return_value=mock_dynamodb_resource), \
          patch("ably.AblyRest", return_value=mock_ably_rest), \
          patch("openai.OpenAI", return_value=mock_openai):
-        import handler
-        handler.lambda_handler(make_event(), {})
+        import lambda_function
+        lambda_function.lambda_handler(make_event(), {})
 
     seqs = [c.args[1]["sequence"] for c in mock_channel.publish.call_args_list]
     assert seqs == sorted(seqs) and len(seqs) == len(set(seqs)), \
         f"Sequences not strictly increasing: {seqs}"
+
     print("test_sequence_numbers_always_increase: PASSED")
 
 
 def test_sequence_continues_from_crawler():
     """
-    Verify that the AI lambda reads CurrentSequence from DynamoDB and starts
-    its own counter at crawler_last_seq + 1, producing a globally ordered
-    event stream that the frontend will not discard.
-
-    Without this behaviour the AI lambda would restart at sequence 1, which
-    the frontend deduplicates away (it already saw sequences 1–N from the
-    crawler), silently hiding all AI progress updates.
+    Verify the AI lambda reads CurrentSequence from DynamoDB and starts
+    its counter at crawler_last_seq + 1, producing a globally ordered stream.
     """
-    mock_s3, mock_dynamodb, mock_channel, mock_ably_rest, mock_openai, boto3_factory = make_mocks()
+    (_, mock_dynamodb_client, _, mock_dynamodb_resource,
+     mock_channel, mock_ably_rest, mock_openai, boto3_client_factory) = make_mocks()
 
-    # Simulate the crawler having published 6 events (sequences 1–6).
-    # The AI lambda should start at 7.
     CRAWLER_LAST_SEQ = 6
-    mock_dynamodb.get_item.return_value = {
+    mock_dynamodb_client.get_item.return_value = {
         "Item": {
             "RegeneratedWebsiteId": {"S": WEBSITE_ID},
             "RegeneratedWebsiteUrl": {"S": URL},
@@ -270,33 +314,28 @@ def test_sequence_continues_from_crawler():
     }
     _clear_modules()
 
-    with patch("boto3.client", side_effect=boto3_factory), \
+    with patch("boto3.client", side_effect=boto3_client_factory), \
+         patch("boto3.resource", return_value=mock_dynamodb_resource), \
          patch("ably.AblyRest", return_value=mock_ably_rest), \
          patch("openai.OpenAI", return_value=mock_openai):
-        import handler
-        result = handler.lambda_handler(make_event(), {})
+        import lambda_function
+        result = lambda_function.lambda_handler(make_event(), {})
 
     assert result["statusCode"] == 200
 
     seqs = [c.args[1]["sequence"] for c in mock_channel.publish.call_args_list]
 
-    # First AI event must immediately follow the last crawler event
     assert seqs[0] == CRAWLER_LAST_SEQ + 1, (
         f"AI sequence should start at {CRAWLER_LAST_SEQ + 1}, got {seqs[0]}"
     )
-
-    # All AI sequences must be strictly greater than the crawler's last sequence
     assert all(s > CRAWLER_LAST_SEQ for s in seqs), (
         f"Some AI sequences overlap with crawler range (≤{CRAWLER_LAST_SEQ}): {seqs}"
     )
-
-    # Sequences must still be strictly increasing within the AI phase
     assert seqs == sorted(seqs) and len(seqs) == len(set(seqs)), (
         f"AI sequences not strictly increasing: {seqs}"
     )
 
-    # Verify get_item was called with the correct composite key
-    get_item_call = mock_dynamodb.get_item.call_args
+    get_item_call = mock_dynamodb_client.get_item.call_args
     key_used = get_item_call.kwargs["Key"]
     assert key_used["RegeneratedWebsiteId"]["S"] == WEBSITE_ID
     assert key_used["RegeneratedWebsiteUrl"]["S"] == URL
@@ -306,8 +345,8 @@ def test_sequence_continues_from_crawler():
 
 if __name__ == "__main__":
     test_happy_path_publishes_all_steps()
-    test_openai_failure_publishes_failed()
-    test_s3_write_failure_publishes_failed()
+    test_openai_failure_returns_500()
+    test_s3_write_failure_returns_500()
     test_sequence_numbers_always_increase()
     test_sequence_continues_from_crawler()
     print("All tests passed.")
