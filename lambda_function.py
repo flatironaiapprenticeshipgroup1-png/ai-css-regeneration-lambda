@@ -76,19 +76,22 @@ def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> lis
 
 
 def lambda_handler(event, context):
-    try:
-        secret = json.loads(
-            secrets_client.get_secret_value(SecretId=os.environ["SECRET_NAME"])["SecretString"]
-        )
-        client = OpenAI(api_key=secret["OpenAIAPIKey"])
+    secret = json.loads(
+        secrets_client.get_secret_value(SecretId=os.environ["SECRET_NAME"])["SecretString"]
+    )
+    client = OpenAI(api_key=secret["OpenAIAPIKey"])
 
-        for record in event["Records"]:
-            body = json.loads(record["body"])
-            website_id = body["RegeneratedWebsiteId"]
+    failed_message_ids = []
+
+    for record in event["Records"]:
+        body = json.loads(record["body"])
+        website_id = body["RegeneratedWebsiteId"]
+        website_url = body["RegeneratedWebsiteUrl"]
+        regeneration_theme = body.get("RegenerationTheme")
+
+        try:
             print(f"Received regeneration request for website ID: {website_id}")
-            website_url = body["RegeneratedWebsiteUrl"]
             print(f"Website URL: {website_url}")
-            regeneration_theme = body.get("RegenerationTheme")
             print(f"Regeneration theme: {regeneration_theme}")
 
             # Idempotency guard: skip if another Lambda invocation already claimed this job.
@@ -121,7 +124,7 @@ def lambda_handler(event, context):
                 publish_status_update(
                     website_id=website_id,
                     website_url=website_url,
-                    phase="crawler",
+                    phase="ai",
                     step=step,
                     status=status,
                     message=message,
@@ -200,8 +203,8 @@ def lambda_handler(event, context):
                     message=f"Regenerated chunk {chunk_index + 1} of {total_chunks}"
                 )
                 return response.choices[0].message.content
-            
-            
+
+
             response = s3.get_object(
                 Bucket=os.environ["BUCKET_NAME"],
                 Key=f"{website_id}/original-styles.css",
@@ -234,7 +237,7 @@ def lambda_handler(event, context):
                 for future in as_completed(futures):
                     idx = futures[future]
                     results[idx] = future.result()
-            
+
             regenerated_parts = [results[i] for i in range(len(chunks))]
 
             regenerated_css = "\n\n".join(regenerated_parts)
@@ -260,20 +263,22 @@ def lambda_handler(event, context):
             print(f"DynamoDB status updated to completed for website ID {website_id}")
             publish(step="Finalizing", status="completed", message="Finished Css Regeneration")
 
-        return {
-            "statusCode": 200,
-            "body": json.dumps(
-                {
-                    "message": "Regeneration completed successfully",
-                    "websiteId": website_id,
-                }
-            ),
-        }
-    except Exception as e:
-        print(f"Error processing regeneration request: {e}")
-        return {
-            "statusCode": 500,
-            "body": json.dumps(
-                {"message": "An error occurred during regeneration", "error": str(e)}
-            ),
-        }
+        except Exception as e:
+            print(f"Error processing record for {website_id}: {e}")
+            # Publish terminal failed event if publish() is defined (it may not be if error happened very early)
+            try:
+                publish("failed", "failed", f"AI regeneration failed: {e}", error=str(e))
+            except Exception:
+                pass
+            # Persist failure to DynamoDB
+            try:
+                table.update_item(
+                    Key={"RegeneratedWebsiteId": website_id, "RegeneratedWebsiteUrl": website_url},
+                    UpdateExpression="SET RegenerationStatus = :s, ErrorMessage = :e",
+                    ExpressionAttributeValues={":s": "failed", ":e": str(e)},
+                )
+            except Exception:
+                pass
+            failed_message_ids.append({"itemIdentifier": record.get("messageId", website_id)})
+
+    return {"batchItemFailures": failed_message_ids}

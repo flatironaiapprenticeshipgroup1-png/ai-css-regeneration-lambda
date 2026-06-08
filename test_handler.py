@@ -3,10 +3,11 @@ Test suite for the AI CSS Regeneration Lambda handler.
 
 Tests verify:
 1. Happy path: all expected steps published with correct sequence numbers
-2. OpenAI failure: 500 returned
-3. S3 write failure: 500 returned
+2. OpenAI failure: batchItemFailures returned and "failed" event published
+3. S3 write failure: batchItemFailures returned and "failed" event published
 4. Sequence numbers: always strictly increasing within a single invocation
 5. Sequence continuation: AI sequences start at crawler_last_seq + 1
+6. Phase: all published events use phase="ai" not "crawler"
 
 Important test-infrastructure notes
 ------------------------------------
@@ -219,7 +220,7 @@ def test_happy_path_publishes_all_steps():
 
         result = lambda_function.lambda_handler(make_event(), {})
 
-    assert result["statusCode"] == 200
+    assert result == {"batchItemFailures": []}
 
     steps = [c.args[1]["step"] for c in mock_channel.publish.call_args_list]
     assert steps == EXPECTED_STEPS, f"Unexpected steps: {steps}"
@@ -246,9 +247,10 @@ def test_happy_path_publishes_all_steps():
     print("test_happy_path_publishes_all_steps: PASSED")
 
 
-def test_openai_failure_returns_500():
+def test_openai_failure_publishes_failed():
     """
-    Verify that an OpenAI error causes a 500 response to be returned.
+    Verify that an OpenAI error causes batchItemFailures to be returned and a
+    "failed" Ably event to be published.
     Steps published before the failure (chunking, regenerating_css) are present;
     Finalizing is not published since the error short-circuits the handler.
     """
@@ -274,19 +276,25 @@ def test_openai_failure_returns_500():
 
         result = lambda_function.lambda_handler(make_event(), {})
 
-    assert result["statusCode"] == 500
+    assert result == {"batchItemFailures": [{"itemIdentifier": WEBSITE_ID}]}
 
     steps = [c.args[1]["step"] for c in mock_channel.publish.call_args_list]
     assert "chunking" in steps
     assert "regenerating_css" in steps
     assert "Finalizing" not in steps
+    assert "failed" in steps
 
-    print("test_openai_failure_returns_500: PASSED")
+    failed_event = next(c.args[1] for c in mock_channel.publish.call_args_list if c.args[1]["step"] == "failed")
+    assert failed_event["status"] == "failed"
+    assert failed_event["error"] is not None
+
+    print("test_openai_failure_publishes_failed: PASSED")
 
 
-def test_s3_write_failure_returns_500():
+def test_s3_write_failure_publishes_failed():
     """
-    Verify that an S3 write error causes a 500 response to be returned.
+    Verify that an S3 write error causes batchItemFailures to be returned and a
+    "failed" Ably event to be published.
     The CSS chunks are regenerated successfully before the write fails, so
     regenerating_css_chunks_completed is published but Finalizing is not.
     """
@@ -312,12 +320,13 @@ def test_s3_write_failure_returns_500():
 
         result = lambda_function.lambda_handler(make_event(), {})
 
-    assert result["statusCode"] == 500
+    assert result == {"batchItemFailures": [{"itemIdentifier": WEBSITE_ID}]}
 
     steps = [c.args[1]["step"] for c in mock_channel.publish.call_args_list]
     assert "Finalizing" not in steps
+    assert "failed" in steps
 
-    print("test_s3_write_failure_returns_500: PASSED")
+    print("test_s3_write_failure_publishes_failed: PASSED")
 
 
 def test_sequence_numbers_always_increase():
@@ -397,7 +406,7 @@ def test_sequence_continues_from_crawler():
 
         result = lambda_function.lambda_handler(make_event(), {})
 
-    assert result["statusCode"] == 200
+    assert result == {"batchItemFailures": []}
 
     seqs = [c.args[1]["sequence"] for c in mock_channel.publish.call_args_list]
 
@@ -425,10 +434,40 @@ def test_sequence_continues_from_crawler():
     print("test_sequence_continues_from_crawler: PASSED")
 
 
+def test_events_use_ai_phase():
+    """Verify all published events use phase='ai', not 'crawler'."""
+    (
+        _,
+        _,
+        _,
+        mock_dynamodb_resource,
+        mock_channel,
+        mock_ably_rest,
+        mock_openai,
+        boto3_client_factory,
+    ) = make_mocks()
+    _clear_modules()
+
+    with patch("boto3.client", side_effect=boto3_client_factory), patch(
+        "boto3.resource", return_value=mock_dynamodb_resource
+    ), patch("ably.AblyRest", return_value=mock_ably_rest), patch(
+        "openai.OpenAI", return_value=mock_openai
+    ):
+        import lambda_function
+
+        lambda_function.lambda_handler(make_event(), {})
+
+    phases = [c.args[1]["phase"] for c in mock_channel.publish.call_args_list]
+    assert all(p == "ai" for p in phases), f"Expected all phases to be 'ai', got: {phases}"
+
+    print("test_events_use_ai_phase: PASSED")
+
+
 if __name__ == "__main__":
     test_happy_path_publishes_all_steps()
-    test_openai_failure_returns_500()
-    test_s3_write_failure_returns_500()
+    test_openai_failure_publishes_failed()
+    test_s3_write_failure_publishes_failed()
     test_sequence_numbers_always_increase()
     test_sequence_continues_from_crawler()
+    test_events_use_ai_phase()
     print("All tests passed.")
