@@ -182,6 +182,8 @@ def publish_status_update(
     if error is not None:
         update_expr += ", ErrorMessage = :error"
         expr_vals[":error"] = {"S": error}
+    else:
+        update_expr += " REMOVE ErrorMessage"
 
     _get_dynamodb_client().update_item(
         TableName=os.environ["DYNAMODB_TABLE_NAME"],
