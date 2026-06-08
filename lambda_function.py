@@ -104,7 +104,6 @@ def lambda_handler(event, context):
             current_status = existing.get("RegenerationStatus")
             if current_status in ("ai_lambda_processing", "completed"):
                 print(f"Skipping duplicate invocation for {website_id}: status is already '{current_status}'")
-                publish(step="Finalizing", status="completed", message="Finished Css Regeneration")
                 continue
 
             table.update_item(
