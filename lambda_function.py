@@ -12,6 +12,7 @@ s3 = boto3.client("s3")
 secrets_client = boto3.client("secretsmanager")
 dynamodb = boto3.resource("dynamodb")
 MAX_CHARS_PER_CHUNK = 30_000
+MAX_CONCURRENT_CHUNK_REQUESTS = 10
 
 def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
     blocks = []
@@ -60,6 +61,19 @@ def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> lis
 
     for block in blocks:
         block_size = len(block)
+
+        # A single block (e.g. a @font-face rule with an embedded base64
+        # data URI) can itself exceed max_chars. Splitting can't respect CSS
+        # syntax at this size, so just slice it into max_chars-sized pieces.
+        if block_size > max_chars:
+            if current_chunk_parts:
+                chunks.append("\n\n".join(current_chunk_parts))
+                current_chunk_parts = []
+                current_chunk_size = 0
+            for start in range(0, block_size, max_chars):
+                chunks.append(block[start:start + max_chars])
+            continue
+
         if current_chunk_parts and current_chunk_size + block_size > max_chars:
             chunks.append("\n\n".join(current_chunk_parts))
             current_chunk_parts = [block]
@@ -228,7 +242,7 @@ def lambda_handler(event, context):
             # process all chunks in parallel (I/O-bound — threads wait on OpenAI, not CPU)
             results = {}
             publish(step="regenerating_css", status="ai_lambda_processing", message="Ai Regenerating Styling CSS for the website")
-            with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+            with ThreadPoolExecutor(max_workers=min(len(chunks), MAX_CONCURRENT_CHUNK_REQUESTS)) as executor:
                 futures = {
                     executor.submit(regenerate_css_chunk, client, chunk, theme_prompt, i, len(chunks)): i
                     for i, chunk in enumerate(chunks)

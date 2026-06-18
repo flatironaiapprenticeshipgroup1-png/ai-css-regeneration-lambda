@@ -21,7 +21,6 @@ import boto3
 from ably import AblyRest
 
 _secrets_client = None
-_ably_client = None
 _dynamodb_client = None
 _ably_api_key = None
 
@@ -52,12 +51,18 @@ def _get_ably_api_key():
     return _ably_api_key
 
 
-def _get_ably_client():
-    """Get or create an Ably REST client (cached as singleton)."""
-    global _ably_client
-    if _ably_client is None:
-        _ably_client = AblyRest(key=_get_ably_api_key())
-    return _ably_client
+def _new_ably_client():
+    """
+    Create a fresh Ably REST client.
+
+    AblyRest's async transport binds to whichever event loop is running when
+    it first makes a request. asyncio.run() creates and tears down a new loop
+    per call, so a cached/shared client ends up holding a transport bound to
+    an already-closed loop the moment a second call runs on a different
+    thread/loop, raising "Event loop is closed". Building a new client inside
+    the same asyncio.run() call that uses it avoids any cross-loop reuse.
+    """
+    return AblyRest(key=_get_ably_api_key())
 
 
 def _get_dynamodb_client():
@@ -157,10 +162,17 @@ def publish_status_update(
         "error": error,
     }
 
-    channel = _get_ably_client().channels.get(f"regeneration:{website_id}")
     # ably-python >= 2.0.0: publish() is a coroutine; asyncio.run() is required
-    # in a synchronous Lambda context to actually send the message.
-    asyncio.run(channel.publish("regeneration-status", payload))
+    # in a synchronous Lambda context to actually send the message. The client
+    # is created here, inside the loop that will run it, so its async
+    # transport never outlives the loop it was bound to (see _new_ably_client).
+    async def _publish():
+        client = _new_ably_client()
+        channel = client.channels.get(f"regeneration:{website_id}")
+        await channel.publish("regeneration-status", payload)
+        await client.close()
+
+    asyncio.run(_publish())
 
     update_expr = (
         "SET CurrentPhase = :phase, CurrentStep = :step, "
