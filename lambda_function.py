@@ -193,6 +193,7 @@ def lambda_handler(event, context):
                         Return ONLY valid CSS — no explanations, no markdown, no code fences,
                         Do not remove any CSS selectors or classes — every original selector must appear in your output,
                         Do not add or reference HTML elements that don't exist in the original,
+                        Do not change width, height, max-width, max-height, object-fit, or aspect-ratio on img, picture, svg, video, or canvas elements — copy those values through unchanged so images keep their original size,
                         The transformation must be immediately obvious at a glance"""
                 )
                 user_msg = (
