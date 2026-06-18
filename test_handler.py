@@ -162,6 +162,7 @@ def make_mocks():
     mock_ably_channel.publish = AsyncMock()
     mock_ably_rest = MagicMock()
     mock_ably_rest.channels.get.return_value = mock_ably_channel
+    mock_ably_rest.close = AsyncMock()
 
     return (
         mock_s3,
