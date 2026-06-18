@@ -67,7 +67,12 @@ def _boto3_client_factory(service, **_):
 with patch("boto3.client", side_effect=_boto3_client_factory), patch(
     "boto3.resource", return_value=_mock_dynamodb_resource
 ), patch("openai.OpenAI", return_value=_mock_openai_client):
-    from lambda_function import lambda_handler
+    from lambda_function import (
+        extract_selectors,
+        find_missing_blocks,
+        lambda_handler,
+        parse_css_blocks,
+    )
 
 
 def make_event(website_id=WEBSITE_ID, url=URL, theme="cyberpunk"):
@@ -464,6 +469,99 @@ def test_events_use_ai_phase():
     print("test_events_use_ai_phase: PASSED")
 
 
+def test_extract_selectors_splits_comma_separated_group():
+    """A rule with multiple comma-separated selectors should yield each one separately."""
+    block = ".gb_H,\n.gb_I,\n.gb_J{fill:currentColor}"
+    assert extract_selectors(block) == [".gb_H", ".gb_I", ".gb_J"]
+    print("test_extract_selectors_splits_comma_separated_group: PASSED")
+
+
+def test_find_missing_blocks_detects_dropped_selector():
+    """
+    Verify find_missing_blocks flags a rule block as dropped when none of its
+    selectors survive into the regenerated CSS — this is the failure mode that
+    let UI elements (e.g. an icon's sizing rule) silently fall back to
+    unstyled/default browser rendering.
+    """
+    original_chunk = (
+        ".gb_D{height:48px;padding:4px}\n\n"
+        ".gb_H,.gb_I,.gb_J{fill:currentColor;color:#444746}\n\n"
+        "body{color:red}"
+    )
+    # Model kept "body" but dropped both .gb_D and the .gb_H group entirely.
+    regenerated = "body{color:neon;font-family:Orbitron}"
+
+    missing = find_missing_blocks(original_chunk, regenerated)
+    missing_selectors = {sel for block in missing for sel in extract_selectors(block)}
+
+    assert ".gb_D" in missing_selectors
+    assert ".gb_H" in missing_selectors
+    assert "body" not in missing_selectors
+    print("test_find_missing_blocks_detects_dropped_selector: PASSED")
+
+
+def test_find_missing_blocks_ignores_partial_class_name_matches():
+    """
+    A selector like '.gb_H' must not be considered "present" just because a
+    differently-named class such as '.gb_HX' appears in the output — that
+    would mask a genuinely dropped rule.
+    """
+    original_chunk = ".gb_H{fill:currentColor}"
+    regenerated = ".gb_HX{fill:gold}"
+
+    missing = find_missing_blocks(original_chunk, regenerated)
+    assert len(missing) == 1
+    print("test_find_missing_blocks_ignores_partial_class_name_matches: PASSED")
+
+
+def test_regenerate_css_chunk_restores_dropped_rules():
+    """
+    End-to-end: when the mocked OpenAI response drops a selector present in
+    the original CSS, the final S3-written CSS must still contain that
+    selector's original rule, restored as a fallback.
+    """
+    (
+        mock_s3,
+        _,
+        _,
+        mock_dynamodb_resource,
+        mock_channel,
+        mock_ably_rest,
+        mock_openai,
+        boto3_client_factory,
+    ) = make_mocks()
+    mock_s3.get_object.return_value = {
+        "Body": MagicMock(
+            read=lambda: b".gb_H{fill:currentColor}\n\nbody{color:red}"
+        )
+    }
+    # The model rewrites "body" but drops ".gb_H" entirely.
+    mock_openai.chat.completions.create.return_value = MagicMock(
+        choices=[
+            MagicMock(message=MagicMock(content="body{color:neon}"), finish_reason="stop")
+        ],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+    _clear_modules()
+
+    with patch("boto3.client", side_effect=boto3_client_factory), patch(
+        "boto3.resource", return_value=mock_dynamodb_resource
+    ), patch("ably.AblyRest", return_value=mock_ably_rest), patch(
+        "openai.OpenAI", return_value=mock_openai
+    ):
+        import lambda_function
+
+        result = lambda_function.lambda_handler(make_event(), {})
+
+    assert result == {"batchItemFailures": []}
+
+    written_css = mock_s3.put_object.call_args.kwargs["Body"].decode("utf-8")
+    assert ".gb_H" in written_css, "Dropped selector should be restored in the final CSS"
+    assert "body{color:neon}" in written_css, "Model's regenerated rule should still be present"
+
+    print("test_regenerate_css_chunk_restores_dropped_rules: PASSED")
+
+
 if __name__ == "__main__":
     test_happy_path_publishes_all_steps()
     test_openai_failure_publishes_failed()
@@ -471,4 +569,8 @@ if __name__ == "__main__":
     test_sequence_numbers_always_increase()
     test_sequence_continues_from_crawler()
     test_events_use_ai_phase()
+    test_extract_selectors_splits_comma_separated_group()
+    test_find_missing_blocks_detects_dropped_selector()
+    test_find_missing_blocks_ignores_partial_class_name_matches()
+    test_regenerate_css_chunk_restores_dropped_rules()
     print("All tests passed.")

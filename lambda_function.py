@@ -14,7 +14,10 @@ dynamodb = boto3.resource("dynamodb")
 MAX_CHARS_PER_CHUNK = 30_000
 MAX_CONCURRENT_CHUNK_REQUESTS = 10
 
-def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
+def parse_css_blocks(css: str) -> list[str]:
+    """Split CSS into top-level rule blocks (selector(s) + braces + body),
+    tracking brace depth so nested rules (e.g. inside @media) stay intact
+    and quoted strings don't confuse brace counting."""
     blocks = []
     current = []
     depth = 0
@@ -55,6 +58,37 @@ def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> lis
     if trailing:
         blocks.insert(0, trailing)
 
+    return blocks
+
+
+def extract_selectors(block: str) -> list[str]:
+    """Return the comma-separated selectors (or @-rule prelude) preceding a block's opening brace."""
+    head = block.split("{", 1)[0]
+    return [s.strip() for s in head.split(",") if s.strip()]
+
+
+def selector_present(selector: str, css: str) -> bool:
+    """Check whether a selector token still appears in regenerated CSS, guarding
+    against partial matches (e.g. '.gb_H' incorrectly matching inside '.gb_HX')."""
+    pattern = re.escape(selector)
+    return re.search(rf"(?<![\w-]){pattern}(?![\w-])", css) is not None
+
+
+def find_missing_blocks(original_chunk: str, regenerated_css: str) -> list[str]:
+    """Return original rule blocks whose selectors are entirely absent from the
+    regenerated CSS — i.e. blocks the model dropped rather than rewrote."""
+    missing = []
+    for block in parse_css_blocks(original_chunk):
+        selectors = extract_selectors(block)
+        if not selectors:
+            continue
+        if not any(selector_present(sel, regenerated_css) for sel in selectors):
+            missing.append(block)
+    return missing
+
+
+def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
+    blocks = parse_css_blocks(css)
     chunks = []
     current_chunk_parts = []
     current_chunk_size = 0
@@ -192,13 +226,19 @@ def lambda_handler(event, context):
                         RULES:
                         Return ONLY valid CSS — no explanations, no markdown, no code fences,
                         Do not remove any CSS selectors or classes — every original selector must appear in your output,
+                        Your output must contain at least as many rule blocks as the input — recount before responding if you are unsure you covered every selector,
                         Do not add or reference HTML elements that don't exist in the original,
                         Do not change width, height, max-width, max-height, object-fit, or aspect-ratio on img, picture, svg, video, or canvas elements — copy those values through unchanged so images and svgs keep their original size,
                         The transformation must be immediately obvious at a glance"""
                 )
+                chunk_blocks = parse_css_blocks(chunk)
+                chunk_selectors = [sel for block in chunk_blocks for sel in extract_selectors(block)]
                 user_msg = (
                     f"{theme_prompt}\n\n"
                     f"This is chunk {chunk_index + 1} of {total_chunks} from the full stylesheet. "
+                    f"This chunk has exactly {len(chunk_blocks)} CSS rule blocks, covering these selectors, "
+                    f"every one of which MUST appear in your output (do not omit, merge, or rename any): "
+                    f"{', '.join(chunk_selectors)}\n\n"
                     f"Regenerate this css: {chunk}"
                 )
                 print(f"Processing chunk {chunk_index + 1}/{total_chunks} ({len(chunk)} chars)...")
@@ -216,7 +256,20 @@ def lambda_handler(event, context):
                     status="ai_lambda_processing",
                     message=f"Regenerated chunk {chunk_index + 1} of {total_chunks}"
                 )
-                return response.choices[0].message.content
+
+                regenerated_css = response.choices[0].message.content
+                missing_blocks = find_missing_blocks(chunk, regenerated_css)
+                if missing_blocks:
+                    print(
+                        f"Chunk {chunk_index + 1}/{total_chunks}: model dropped {len(missing_blocks)} "
+                        f"rule block(s); restoring original CSS for those selectors so elements don't "
+                        f"fall back to unstyled/default sizing"
+                    )
+                    regenerated_css += (
+                        "\n\n/* Restored: original rules omitted by AI regeneration */\n"
+                        + "\n\n".join(missing_blocks)
+                    )
+                return regenerated_css
 
 
             response = s3.get_object(
