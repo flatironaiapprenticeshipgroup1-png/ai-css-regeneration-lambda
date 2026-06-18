@@ -177,6 +177,7 @@ def lambda_handler(event, context):
                         SPACING & LAYOUT:
                         Change padding and margin values to reflect the theme's density,
                         Compact themes feel tight; luxurious themes use generous whitespace,
+                        Do not change values that affect element size or position — width, height, min-width, min-height, max-width, max-height, position, top, right, bottom, left, display, flex, flex-direction, flex-grow, flex-shrink, flex-basis, grid-template-columns, grid-template-rows, grid-column, grid-row, gap, z-index, float, transform (when used for layout/positioning),
 
                         DECORATIVE EFFECTS:
                         Add or rewrite box-shadow, text-shadow, and gradients,
