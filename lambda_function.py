@@ -177,7 +177,6 @@ def lambda_handler(event, context):
                         SPACING & LAYOUT:
                         Change padding and margin values to reflect the theme's density,
                         Compact themes feel tight; luxurious themes use generous whitespace,
-                        Do not change values that affect element size or position — width, height, min-width, min-height, max-width, max-height, position, top, right, bottom, left, display, flex, flex-direction, flex-grow, flex-shrink, flex-basis, grid-template-columns, grid-template-rows, grid-column, grid-row, gap, z-index, float, transform (when used for layout/positioning),
 
                         DECORATIVE EFFECTS:
                         Add or rewrite box-shadow, text-shadow, and gradients,
@@ -194,7 +193,7 @@ def lambda_handler(event, context):
                         Return ONLY valid CSS — no explanations, no markdown, no code fences,
                         Do not remove any CSS selectors or classes — every original selector must appear in your output,
                         Do not add or reference HTML elements that don't exist in the original,
-                        Do not change width, height, max-width, max-height, object-fit, or aspect-ratio on img, picture, svg, video, or canvas elements — copy those values through unchanged so images keep their original size,
+                        Do not change width, height, max-width, max-height, object-fit, or aspect-ratio on img, picture, svg, video, or canvas elements — copy those values through unchanged so images and svgs keep their original size,
                         The transformation must be immediately obvious at a glance"""
                 )
                 user_msg = (
