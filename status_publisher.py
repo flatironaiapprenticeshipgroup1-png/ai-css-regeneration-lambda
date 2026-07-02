@@ -168,14 +168,11 @@ def publish_status_update(
     # transport never outlives the loop it was bound to (see _new_ably_client).
     async def _publish():
         client = _new_ably_client()
-        channel = client.channels.get(f"regeneration:{website_id}")
-        await channel.publish("regeneration-status", payload)
-        await client.close()
-        # try:
-        #     channel = client.channels.get(f"regeneration:{website_id}")
-        #     await channel.publish("regeneration-status", payload)
-        # finally:
-        #     await client.close()
+        try:
+            channel = client.channels.get(f"regeneration:{website_id}")
+            await channel.publish("regeneration-status", payload)
+        finally:
+            await client.close()
 
     asyncio.run(_publish())
 
