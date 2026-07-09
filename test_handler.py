@@ -1,5 +1,5 @@
 """
-Test suite for the AI CSS Regeneration Lambda handler.
+Test suite for the AI HTML/CSS Regeneration Lambda handler.
 
 Tests verify:
 1. Happy path: all expected steps published with correct sequence numbers
@@ -37,6 +37,7 @@ Important test-infrastructure notes
 
 import json
 import os
+import re
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -67,12 +68,10 @@ def _boto3_client_factory(service, **_):
 with patch("boto3.client", side_effect=_boto3_client_factory), patch(
     "boto3.resource", return_value=_mock_dynamodb_resource
 ), patch("openai.OpenAI", return_value=_mock_openai_client):
-    from lambda_function import (
-        extract_selectors,
-        find_missing_blocks,
-        lambda_handler,
-        parse_css_blocks,
-    )
+    from lambda_function import lambda_handler
+
+from html_chunker import split_html_into_chunks
+from inline_html_regenerator import regenerate_html
 
 
 def make_event(website_id=WEBSITE_ID, url=URL, theme="cyberpunk"):
@@ -120,7 +119,10 @@ def make_mocks():
     """
     mock_s3 = MagicMock()
     mock_s3.get_object.return_value = {
-        "Body": MagicMock(read=lambda: b"body { color: red; }")
+        "Body": MagicMock(
+            read=lambda: b"<html><head><title>Original</title></head>"
+            b"<body><div style=\"color:red\">Hi</div></body></html>"
+        )
     }
 
     # Low-level DynamoDB client used by status_publisher
@@ -156,7 +158,7 @@ def make_mocks():
     mock_openai.chat.completions.create.return_value = MagicMock(
         choices=[
             MagicMock(
-                message=MagicMock(content="body { color: neon; }"),
+                message=MagicMock(content='<div style="color:neon">Hi</div>'),
                 finish_reason="stop",
             )
         ],
@@ -188,13 +190,13 @@ def _clear_modules():
             del sys.modules[mod]
 
 
-# Expected publish steps for a single-chunk CSS (the default b"body { color: red; }" mock).
-# The mock CSS is one rule block, so split_css_into_chunks returns one chunk, producing
-# exactly one "regenerating_css_chunks_completed" event.
+# Expected publish steps for the default mock HTML, which has a single top-level
+# <body> child. split_html_into_chunks returns [head, body-div], and the head chunk
+# doesn't go through the model, so there's exactly one "regenerating_html_chunks_completed" event.
 EXPECTED_STEPS = [
     "chunking",
-    "regenerating_css",
-    "regenerating_css_chunks_completed",
+    "regenerating_html",
+    "regenerating_html_chunks_completed",
     "Finalizing",
 ]
 
@@ -202,7 +204,7 @@ EXPECTED_STEPS = [
 def test_happy_path_publishes_all_steps():
     """
     Verify that a successful run publishes all expected steps in order with
-    monotonically increasing sequence numbers, writes the CSS to S3, and
+    monotonically increasing sequence numbers, writes the regenerated HTML to S3, and
     updates DynamoDB status via both the resource table and the publisher client.
     """
     (
@@ -242,7 +244,8 @@ def test_happy_path_publishes_all_steps():
 
     assert mock_s3.put_object.call_count == 1
     key = mock_s3.put_object.call_args.kwargs["Key"]
-    assert key == f"{WEBSITE_ID}/Regenerated-Styles.css"
+    assert key == f"{WEBSITE_ID}/Regenerated-Index.html"
+    assert mock_s3.put_object.call_args.kwargs["ContentType"] == "text/html; charset=utf-8"
 
     # status_publisher's update_item called once per Ably publish
     assert mock_dynamodb_client.update_item.call_count == len(EXPECTED_STEPS)
@@ -257,7 +260,7 @@ def test_openai_failure_publishes_failed():
     """
     Verify that an OpenAI error causes batchItemFailures to be returned and a
     "failed" Ably event to be published.
-    Steps published before the failure (chunking, regenerating_css) are present;
+    Steps published before the failure (chunking, regenerating_html) are present;
     Finalizing is not published since the error short-circuits the handler.
     """
     (
@@ -286,7 +289,7 @@ def test_openai_failure_publishes_failed():
 
     steps = [c.args[1]["step"] for c in mock_channel.publish.call_args_list]
     assert "chunking" in steps
-    assert "regenerating_css" in steps
+    assert "regenerating_html" in steps
     assert "Finalizing" not in steps
     assert "failed" in steps
 
@@ -301,8 +304,8 @@ def test_s3_write_failure_publishes_failed():
     """
     Verify that an S3 write error causes batchItemFailures to be returned and a
     "failed" Ably event to be published.
-    The CSS chunks are regenerated successfully before the write fails, so
-    regenerating_css_chunks_completed is published but Finalizing is not.
+    The HTML chunks are regenerated successfully before the write fails, so
+    regenerating_html_chunks_completed is published but Finalizing is not.
     """
     (
         mock_s3,
@@ -469,56 +472,66 @@ def test_events_use_ai_phase():
     print("test_events_use_ai_phase: PASSED")
 
 
-def test_extract_selectors_splits_comma_separated_group():
-    """A rule with multiple comma-separated selectors should yield each one separately."""
-    block = ".gb_H,\n.gb_I,\n.gb_J{fill:currentColor}"
-    assert extract_selectors(block) == [".gb_H", ".gb_I", ".gb_J"]
-    print("test_extract_selectors_splits_comma_separated_group: PASSED")
+def test_split_html_into_chunks_labels_head_and_body():
+    """A well-formed document yields a 'head' chunk followed by 'body' chunk(s)."""
+    html = '<html><head><title>T</title></head><body><div class="a">Hi</div></body></html>'
+    chunks, labels = split_html_into_chunks(html)
+    assert labels == ["head", "body"]
+    assert "<title>T</title>" in chunks[0]
+    assert '<div class="a">Hi</div>' in chunks[1]
+    print("test_split_html_into_chunks_labels_head_and_body: PASSED")
 
 
-def test_find_missing_blocks_detects_dropped_selector():
+def test_split_html_into_chunks_strips_stale_stylesheet_link():
     """
-    Verify find_missing_blocks flags a rule block as dropped when none of its
-    selectors survive into the regenerated CSS — this is the failure mode that
-    let UI elements (e.g. an icon's sizing rule) silently fall back to
-    unstyled/default browser rendering.
+    A leftover <link rel="stylesheet" href="./Regenerated-Styles.css"> from the old
+    pipeline shape must be removed — that file is no longer written by this lambda.
     """
-    original_chunk = (
-        ".gb_D{height:48px;padding:4px}\n\n"
-        ".gb_H,.gb_I,.gb_J{fill:currentColor;color:#444746}\n\n"
-        "body{color:red}"
+    html = (
+        '<html><head><link rel="stylesheet" href="./Regenerated-Styles.css">'
+        "<title>T</title></head><body><div>Hi</div></body></html>"
     )
-    # Model kept "body" but dropped both .gb_D and the .gb_H group entirely.
-    regenerated = "body{color:neon;font-family:Orbitron}"
-
-    missing = find_missing_blocks(original_chunk, regenerated)
-    missing_selectors = {sel for block in missing for sel in extract_selectors(block)}
-
-    assert ".gb_D" in missing_selectors
-    assert ".gb_H" in missing_selectors
-    assert "body" not in missing_selectors
-    print("test_find_missing_blocks_detects_dropped_selector: PASSED")
+    chunks, labels = split_html_into_chunks(html)
+    assert "Regenerated-Styles.css" not in chunks[0]
+    print("test_split_html_into_chunks_strips_stale_stylesheet_link: PASSED")
 
 
-def test_find_missing_blocks_ignores_partial_class_name_matches():
+def test_split_html_into_chunks_packs_body_children_within_max_chars():
+    """Small top-level body children are packed together into one chunk when they
+    fit under max_chars, but a child that alone exceeds max_chars starts a new one."""
+    html = (
+        "<html><head></head><body>"
+        '<div class="a">small</div><div class="b">also-small</div>'
+        "</body></html>"
+    )
+    chunks, labels = split_html_into_chunks(html, max_chars=1000)
+    assert labels == ["head", "body"]
+    assert "class=\"a\"" in chunks[1] and "class=\"b\"" in chunks[1]
+
+    big_html = (
+        "<html><head></head><body>"
+        f'<div class="a">{"x" * 50}</div><div class="b">{"y" * 50}</div>'
+        "</body></html>"
+    )
+    small_chunks, small_labels = split_html_into_chunks(big_html, max_chars=60)
+    assert small_labels == ["head", "body", "body"]
+    print("test_split_html_into_chunks_packs_body_children_within_max_chars: PASSED")
+
+
+def test_split_html_into_chunks_falls_back_to_raw_without_head_or_body():
+    """Documents that can't be parsed into head/body fall back to a single raw chunk."""
+    html = "<div>not a full document</div>"
+    chunks, labels = split_html_into_chunks(html)
+    assert labels == ["raw"]
+    assert chunks == [html]
+    print("test_split_html_into_chunks_falls_back_to_raw_without_head_or_body: PASSED")
+
+
+def test_regenerate_html_chunk_keeps_original_when_model_returns_empty():
     """
-    A selector like '.gb_H' must not be considered "present" just because a
-    differently-named class such as '.gb_HX' appears in the output — that
-    would mask a genuinely dropped rule.
-    """
-    original_chunk = ".gb_H{fill:currentColor}"
-    regenerated = ".gb_HX{fill:gold}"
-
-    missing = find_missing_blocks(original_chunk, regenerated)
-    assert len(missing) == 1
-    print("test_find_missing_blocks_ignores_partial_class_name_matches: PASSED")
-
-
-def test_regenerate_css_chunk_restores_dropped_rules():
-    """
-    End-to-end: when the mocked OpenAI response drops a selector present in
-    the original CSS, the final S3-written CSS must still contain that
-    selector's original rule, restored as a fallback.
+    End-to-end: when the mocked OpenAI response returns empty content for a chunk,
+    the final S3-written HTML must still contain that chunk's original content
+    rather than losing it.
     """
     (
         mock_s3,
@@ -532,14 +545,11 @@ def test_regenerate_css_chunk_restores_dropped_rules():
     ) = make_mocks()
     mock_s3.get_object.return_value = {
         "Body": MagicMock(
-            read=lambda: b".gb_H{fill:currentColor}\n\nbody{color:red}"
+            read=lambda: b'<html><head></head><body><div class="keep-me">Hi</div></body></html>'
         )
     }
-    # The model rewrites "body" but drops ".gb_H" entirely.
     mock_openai.chat.completions.create.return_value = MagicMock(
-        choices=[
-            MagicMock(message=MagicMock(content="body{color:neon}"), finish_reason="stop")
-        ],
+        choices=[MagicMock(message=MagicMock(content=""), finish_reason="stop")],
         usage=MagicMock(prompt_tokens=100, completion_tokens=200),
     )
     _clear_modules()
@@ -555,11 +565,155 @@ def test_regenerate_css_chunk_restores_dropped_rules():
 
     assert result == {"batchItemFailures": []}
 
-    written_css = mock_s3.put_object.call_args.kwargs["Body"].decode("utf-8")
-    assert ".gb_H" in written_css, "Dropped selector should be restored in the final CSS"
-    assert "body{color:neon}" in written_css, "Model's regenerated rule should still be present"
+    written_html = mock_s3.put_object.call_args.kwargs["Body"].decode("utf-8")
+    assert 'class="keep-me"' in written_html, "Original chunk content should be preserved"
 
-    print("test_regenerate_css_chunk_restores_dropped_rules: PASSED")
+    print("test_regenerate_html_chunk_keeps_original_when_model_returns_empty: PASSED")
+
+
+def test_regenerate_html_chunk_keeps_original_when_model_drops_image():
+    """
+    End-to-end: if the model's regenerated chunk is missing an <img> src that was
+    present in the original, the final S3-written HTML must still contain that
+    image rather than losing it (mirrors the empty-output fallback).
+    """
+    (
+        mock_s3,
+        _,
+        _,
+        mock_dynamodb_resource,
+        mock_channel,
+        mock_ably_rest,
+        mock_openai,
+        boto3_client_factory,
+    ) = make_mocks()
+    mock_s3.get_object.return_value = {
+        "Body": MagicMock(
+            read=lambda: b'<html><head></head><body><img src="./images/img-0.jpg"></body></html>'
+        )
+    }
+    mock_openai.chat.completions.create.return_value = MagicMock(
+        choices=[MagicMock(message=MagicMock(content="<p>no image here</p>"), finish_reason="stop")],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+    _clear_modules()
+
+    with patch("boto3.client", side_effect=boto3_client_factory), patch(
+        "boto3.resource", return_value=mock_dynamodb_resource
+    ), patch("ably.AblyRest", return_value=mock_ably_rest), patch(
+        "openai.OpenAI", return_value=mock_openai
+    ):
+        import lambda_function
+
+        result = lambda_function.lambda_handler(make_event(), {})
+
+    assert result == {"batchItemFailures": []}
+
+    written_html = mock_s3.put_object.call_args.kwargs["Body"].decode("utf-8")
+    assert 'src="./images/img-0.jpg"' in written_html, "Dropped image should be restored"
+
+    print("test_regenerate_html_chunk_keeps_original_when_model_drops_image: PASSED")
+
+
+def test_none_theme_does_not_leak_into_prompt():
+    """
+    When RegenerationTheme is None, the system prompt sent to the model must use a
+    safe fallback label instead of interpolating the literal string "None".
+    """
+    (
+        mock_s3,
+        _,
+        _,
+        mock_dynamodb_resource,
+        mock_channel,
+        mock_ably_rest,
+        mock_openai,
+        boto3_client_factory,
+    ) = make_mocks()
+    _clear_modules()
+
+    with patch("boto3.client", side_effect=boto3_client_factory), patch(
+        "boto3.resource", return_value=mock_dynamodb_resource
+    ), patch("ably.AblyRest", return_value=mock_ably_rest), patch(
+        "openai.OpenAI", return_value=mock_openai
+    ):
+        import lambda_function
+
+        result = lambda_function.lambda_handler(make_event(theme=None), {})
+
+    assert result == {"batchItemFailures": []}
+
+    system_msg = mock_openai.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert re.search(r"\bNone\b", system_msg) is None, "Literal 'None' must not leak into the prompt"
+    assert "a clean modern redesign" in system_msg
+
+    print("test_none_theme_does_not_leak_into_prompt: PASSED")
+
+
+def test_regenerate_html_reassembles_style_block_with_import_before_other_rules():
+    """
+    Multiple body chunks can each emit hover/keyframe rules and font @import
+    statements via a trailing <!--STYLE:...--> comment (since inline style="..."
+    attributes can't express :hover, @keyframes, or @import). regenerate_html must
+    strip those comments from the body and assemble them into a single <style>
+    block in <head>, with any @import lines placed first per the CSS spec.
+    """
+    big_a = "a" * 20000
+    big_b = "b" * 20000
+    html = (
+        "<html><head><title>T</title></head><body>"
+        f'<div class="chunk-a">{big_a}</div>'
+        f'<div class="chunk-b">{big_b}</div>'
+        "</body></html>"
+    )
+
+    def side_effect(**kwargs):
+        user_content = kwargs["messages"][1]["content"]
+        if "chunk-a" in user_content:
+            content = (
+                '<div class="chunk-a" style="color:red">A</div>'
+                "<!--STYLE:@import url('https://fonts.googleapis.com/css2?family=Orbitron');"
+                " .chunk-a-hover:hover{color:gold} @keyframes pulse{0%{opacity:1}}-->"
+            )
+        else:
+            content = '<div class="chunk-b" style="color:blue">B</div>'
+        return MagicMock(
+            choices=[MagicMock(message=MagicMock(content=content), finish_reason="stop")],
+            usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+        )
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = side_effect
+
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+
+    assert result.count("<style>") == 1
+    style_block = result.split("<style>")[1].split("</style>")[0]
+    assert style_block.strip().startswith("@import"), "@import must precede other rules"
+    assert ".chunk-a-hover:hover{color:gold}" in style_block
+    assert "@keyframes pulse" in style_block
+    assert "<!--STYLE:" not in result, "STYLE comment should be stripped from the body"
+    assert 'class="chunk-a"' in result and 'class="chunk-b"' in result
+
+    print("test_regenerate_html_reassembles_style_block_with_import_before_other_rules: PASSED")
+
+
+def test_regenerate_html_raw_fallback_returns_model_output_directly():
+    """When head/body can't be parsed, regenerate_html sends the whole document as
+    one chunk and returns the model's output as-is, with no <!DOCTYPE> wrapping added."""
+    html = "<div>just a fragment, not a full document</div>"
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = MagicMock(
+        choices=[MagicMock(message=MagicMock(content="<div>regenerated fragment</div>"), finish_reason="stop")],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+
+    assert result == "<div>regenerated fragment</div>"
+    assert "<!DOCTYPE" not in result
+
+    print("test_regenerate_html_raw_fallback_returns_model_output_directly: PASSED")
 
 
 if __name__ == "__main__":
@@ -569,8 +723,13 @@ if __name__ == "__main__":
     test_sequence_numbers_always_increase()
     test_sequence_continues_from_crawler()
     test_events_use_ai_phase()
-    test_extract_selectors_splits_comma_separated_group()
-    test_find_missing_blocks_detects_dropped_selector()
-    test_find_missing_blocks_ignores_partial_class_name_matches()
-    test_regenerate_css_chunk_restores_dropped_rules()
+    test_split_html_into_chunks_labels_head_and_body()
+    test_split_html_into_chunks_strips_stale_stylesheet_link()
+    test_split_html_into_chunks_packs_body_children_within_max_chars()
+    test_split_html_into_chunks_falls_back_to_raw_without_head_or_body()
+    test_regenerate_html_chunk_keeps_original_when_model_returns_empty()
+    test_regenerate_html_chunk_keeps_original_when_model_drops_image()
+    test_none_theme_does_not_leak_into_prompt()
+    test_regenerate_html_reassembles_style_block_with_import_before_other_rules()
+    test_regenerate_html_raw_fallback_returns_model_output_directly()
     print("All tests passed.")

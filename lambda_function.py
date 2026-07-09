@@ -1,126 +1,16 @@
 import json
 import os
-import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from status_publisher import get_current_sequence, publish_status_update
 
 import boto3
 from openai import OpenAI
 
+from inline_html_regenerator import regenerate_html
+
 s3 = boto3.client("s3")
 secrets_client = boto3.client("secretsmanager")
 dynamodb = boto3.resource("dynamodb")
-MAX_CHARS_PER_CHUNK = 30_000
-MAX_CONCURRENT_CHUNK_REQUESTS = 10
-
-def parse_css_blocks(css: str) -> list[str]:
-    """Split CSS into top-level rule blocks (selector(s) + braces + body),
-    tracking brace depth so nested rules (e.g. inside @media) stay intact
-    and quoted strings don't confuse brace counting."""
-    blocks = []
-    current = []
-    depth = 0
-    i = 0
-
-    while i < len(css):
-        ch = css[i]
-        if ch in ('"', "'"):
-            quote = ch
-            current.append(ch)
-            i += 1
-            while i < len(css) and css[i] != quote:
-                if css[i] == "\\" and i + 1 < len(css):
-                    current.append(css[i])
-                    i += 1
-                current.append(css[i])
-                i += 1
-            if i < len(css):
-                current.append(css[i])
-            i += 1
-            continue
-
-        current.append(ch)
-
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                block = "".join(current).strip()
-                if block:
-                    blocks.append(block)
-                current = []
-
-        i += 1
-
-    trailing = "".join(current).strip()
-    if trailing:
-        blocks.insert(0, trailing)
-
-    return blocks
-
-
-def extract_selectors(block: str) -> list[str]:
-    """Return the comma-separated selectors (or @-rule prelude) preceding a block's opening brace."""
-    head = block.split("{", 1)[0]
-    return [s.strip() for s in head.split(",") if s.strip()]
-
-
-def selector_present(selector: str, css: str) -> bool:
-    """Check whether a selector token still appears in regenerated CSS, guarding
-    against partial matches (e.g. '.gb_H' incorrectly matching inside '.gb_HX')."""
-    pattern = re.escape(selector)
-    return re.search(rf"(?<![\w-]){pattern}(?![\w-])", css) is not None
-
-
-def find_missing_blocks(original_chunk: str, regenerated_css: str) -> list[str]:
-    """Return original rule blocks whose selectors are entirely absent from the
-    regenerated CSS — i.e. blocks the model dropped rather than rewrote."""
-    missing = []
-    for block in parse_css_blocks(original_chunk):
-        selectors = extract_selectors(block)
-        if not selectors:
-            continue
-        if not any(selector_present(sel, regenerated_css) for sel in selectors):
-            missing.append(block)
-    return missing
-
-
-def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
-    blocks = parse_css_blocks(css)
-    chunks = []
-    current_chunk_parts = []
-    current_chunk_size = 0
-
-    for block in blocks:
-        block_size = len(block)
-
-        # A single block (e.g. a @font-face rule with an embedded base64
-        # data URI) can itself exceed max_chars. Splitting can't respect CSS
-        # syntax at this size, so just slice it into max_chars-sized pieces.
-        if block_size > max_chars:
-            if current_chunk_parts:
-                chunks.append("\n\n".join(current_chunk_parts))
-                current_chunk_parts = []
-                current_chunk_size = 0
-            for start in range(0, block_size, max_chars):
-                chunks.append(block[start:start + max_chars])
-            continue
-
-        if current_chunk_parts and current_chunk_size + block_size > max_chars:
-            chunks.append("\n\n".join(current_chunk_parts))
-            current_chunk_parts = [block]
-            current_chunk_size = block_size
-        else:
-            current_chunk_parts.append(block)
-            current_chunk_size += block_size
-
-    if current_chunk_parts:
-        chunks.append("\n\n".join(current_chunk_parts))
-
-    return chunks
-
 
 
 def lambda_handler(event, context):
@@ -180,144 +70,42 @@ def lambda_handler(event, context):
                     error=error,
                 )
 
-            def regenerate_css_chunk(
-                client: OpenAI,
-                chunk: str,
-                theme_prompt: str,
-                chunk_index: int,
-                total_chunks: int,
-            ) -> str:
-                system_msg = (
-                    f"""You are a CSS and web design expert specializing in dramatic visual transformations.
-
-                        You will receive chunks of a CSS file. Rewrite them completely to match this theme: {regeneration_theme}
-
-                        You MUST change ALL of the following — not just colors:
-
-                        TYPOGRAPHY:
-                        Replace every font-family declaration with theme-appropriate fonts,
-                        Use @import to load Google Fonts if needed (add at the top),
-                        Change font sizes, weights, letter-spacing, and line-height to match the theme,
-
-                        COLORS:
-                        Replace every background-color, color, and border-color,
-                        Build a cohesive color palette — do not just swap one color for another,
-                        Apply the palette consistently across all elements,
-
-                        BORDERS & SHAPES:
-                        Change border styles, widths, and border-radius values,
-                        A futuristic theme might use sharp corners; organic themes use rounded ones,
-
-                        SPACING & LAYOUT:
-                        Change padding and margin values to reflect the theme's density,
-                        Compact themes feel tight; luxurious themes use generous whitespace,
-
-                        DECORATIVE EFFECTS:
-                        Add or rewrite box-shadow, text-shadow, and gradients,
-                        Use background-image gradients where appropriate,
-
-                        ANIMATIONS:
-                        Add animations like hover effects or keyframe animations that fit the theme
-
-                        also add cool dramatic animations in the background to make the website more visually appealing and engaging
-
-                        IT IS VERY IMPORTANT THAT THE WEBSITE LOOKS CLEAN AND NOT CLUNKY/MESSY
-
-                        RULES:
-                        Return ONLY valid CSS — no explanations, no markdown, no code fences,
-                        Do not remove any CSS selectors or classes — every original selector must appear in your output,
-                        Your output must contain at least as many rule blocks as the input — recount before responding if you are unsure you covered every selector,
-                        Do not add or reference HTML elements that don't exist in the original,
-                        Do not change width, height, max-width, max-height, object-fit, or aspect-ratio on img, picture, svg, video, or canvas elements — copy those values through unchanged so images and svgs keep their original size,
-                        The transformation must be immediately obvious at a glance"""
-                )
-                chunk_blocks = parse_css_blocks(chunk)
-                chunk_selectors = [sel for block in chunk_blocks for sel in extract_selectors(block)]
-                user_msg = (
-                    f"{theme_prompt}\n\n"
-                    f"This is chunk {chunk_index + 1} of {total_chunks} from the full stylesheet. "
-                    f"This chunk has exactly {len(chunk_blocks)} CSS rule blocks, covering these selectors, "
-                    f"every one of which MUST appear in your output (do not omit, merge, or rename any): "
-                    f"{', '.join(chunk_selectors)}\n\n"
-                    f"Regenerate this css: {chunk}"
-                )
-                print(f"Processing chunk {chunk_index + 1}/{total_chunks} ({len(chunk)} chars)...")
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    max_tokens=16384,
-                )
-
+            def on_chunk_complete(chunk_index, total_chunks):
                 publish(
-                    step=f"regenerating_css_chunks_completed",
+                    step="regenerating_html_chunks_completed",
                     status="ai_lambda_processing",
                     message=f"Regenerated chunk {chunk_index + 1} of {total_chunks}"
                 )
 
-                regenerated_css = response.choices[0].message.content
-                missing_blocks = find_missing_blocks(chunk, regenerated_css)
-                if missing_blocks:
-                    print(
-                        f"Chunk {chunk_index + 1}/{total_chunks}: model dropped {len(missing_blocks)} "
-                        f"rule block(s); restoring original CSS for those selectors so elements don't "
-                        f"fall back to unstyled/default sizing"
-                    )
-                    regenerated_css += (
-                        "\n\n/* Restored: original rules omitted by AI regeneration */\n"
-                        + "\n\n".join(missing_blocks)
-                    )
-                return regenerated_css
-
-
             response = s3.get_object(
                 Bucket=os.environ["BUCKET_NAME"],
-                Key=f"{website_id}/original-styles.css",
+                Key=f"{website_id}/Regenerated-Index.html",
             )
             content = response["Body"].read().decode("utf-8")
-            print(f"CSS file size: {len(content)} characters")
+            print(f"HTML file size: {len(content)} characters")
 
             if regeneration_theme is None:
                 theme_prompt = (
-                    "Regenerate the CSS using modern practices while maintaining the original feel."
+                    "Regenerate the page using modern practices while maintaining the original feel."
                 )
             else:
                 theme_prompt = (
-                    f"Regenerate the CSS using the theme: {regeneration_theme}."
+                    f"Regenerate the page using the theme: {regeneration_theme}."
                 )
 
-            # Split into chunks if the file is large
-            publish(step="chunking", status="ai_lambda_processing", message="Compressing CSS into chunks for processing")
-            chunks = split_css_into_chunks(content)
-            print(f"Split CSS into {len(chunks)} chunk(s) for processing")
-
-            # process all chunks in parallel (I/O-bound — threads wait on OpenAI, not CPU)
-            results = {}
-            publish(step="regenerating_css", status="ai_lambda_processing", message="Ai Regenerating Styling CSS for the website")
-            with ThreadPoolExecutor(max_workers=min(len(chunks), MAX_CONCURRENT_CHUNK_REQUESTS)) as executor:
-                futures = {
-                    executor.submit(regenerate_css_chunk, client, chunk, theme_prompt, i, len(chunks)): i
-                    for i, chunk in enumerate(chunks)
-                }
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    results[idx] = future.result()
-
-            regenerated_parts = [results[i] for i in range(len(chunks))]
-
-            regenerated_css = "\n\n".join(regenerated_parts)
-            print(f"Regenerated CSS total size: {len(regenerated_css)} characters")
+            publish(step="chunking", status="ai_lambda_processing", message="Compressing HTML into chunks for processing")
+            publish(step="regenerating_html", status="ai_lambda_processing", message="Ai Regenerating HTML and styling for the website")
+            regenerated_html = regenerate_html(client, content, theme_prompt, regeneration_theme, on_chunk_complete)
+            print(f"Regenerated HTML total size: {len(regenerated_html)} characters")
 
             s3.put_object(
                 Bucket=os.environ["BUCKET_NAME"],
-                Key=f"{website_id}/Regenerated-Styles.css",
-                Body=regenerated_css.encode("utf-8"),
-                ContentType="text/css",
+                Key=f"{website_id}/Regenerated-Index.html",
+                Body=regenerated_html.encode("utf-8"),
+                ContentType="text/html; charset=utf-8",
                 CacheControl="no-store, no-cache, must-revalidate",
             )
-            print(f"Regenerated CSS saved to S3 for website ID {website_id}")
+            print(f"Regenerated HTML saved to S3 for website ID {website_id}")
 
             table.update_item(
                 Key={
@@ -328,7 +116,7 @@ def lambda_handler(event, context):
                 ExpressionAttributeValues={":status": "completed"},
             )
             print(f"DynamoDB status updated to completed for website ID {website_id}")
-            publish(step="Finalizing", status="completed", message="Finished Css Regeneration")
+            publish(step="Finalizing", status="completed", message="Finished HTML and CSS Regeneration")
 
         except Exception as e:
             print(f"Error processing record for {website_id}: {e}")
