@@ -716,6 +716,73 @@ def test_regenerate_html_raw_fallback_returns_model_output_directly():
     print("test_regenerate_html_raw_fallback_returns_model_output_directly: PASSED")
 
 
+def test_regenerate_html_raw_fallback_extracts_style_comment_into_style_block():
+    """When head/body can't be parsed and the model still emits a trailing
+    <!--STYLE:...--> comment (e.g. for a keyframes animation), it must be turned
+    into a real <style> block rather than left as an inert HTML comment, or the
+    animation would silently never render."""
+    html = "<div>just a fragment, not a full document</div>"
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = MagicMock(
+        choices=[
+            MagicMock(
+                message=MagicMock(
+                    content='<div class="pulse">regenerated fragment</div>'
+                    "<!--STYLE:.pulse{animation:pulse 2s infinite} @keyframes pulse{0%{opacity:1}}-->"
+                ),
+                finish_reason="stop",
+            )
+        ],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+
+    assert "<!--STYLE:" not in result, "STYLE comment should be stripped from the output"
+    assert "<style>" in result and "</style>" in result
+    style_block = result.split("<style>")[1].split("</style>")[0]
+    assert "@keyframes pulse" in style_block
+    assert '<div class="pulse">regenerated fragment</div>' in result
+
+    print("test_regenerate_html_raw_fallback_extracts_style_comment_into_style_block: PASSED")
+
+
+def test_regenerate_html_dedupes_identical_style_rules_across_chunks():
+    """Chunks are regenerated independently and in parallel, so two chunks can
+    emit byte-identical hover/keyframe rules (e.g. a shared fade-in animation).
+    The assembled <style> block must not contain duplicate copies."""
+    big_a = "a" * 20000
+    big_b = "b" * 20000
+    html = (
+        "<html><head><title>T</title></head><body>"
+        f'<div class="chunk-a">{big_a}</div>'
+        f'<div class="chunk-b">{big_b}</div>'
+        "</body></html>"
+    )
+    shared_rule = "@keyframes fadeIn{0%{opacity:0}100%{opacity:1}}"
+
+    def side_effect(**kwargs):
+        user_content = kwargs["messages"][1]["content"]
+        if "chunk-a" in user_content:
+            content = f'<div class="chunk-a fade-in" style="color:red">A</div><!--STYLE:{shared_rule}-->'
+        else:
+            content = f'<div class="chunk-b fade-in" style="color:blue">B</div><!--STYLE:{shared_rule}-->'
+        return MagicMock(
+            choices=[MagicMock(message=MagicMock(content=content), finish_reason="stop")],
+            usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+        )
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = side_effect
+
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+
+    style_block = result.split("<style>")[1].split("</style>")[0]
+    assert style_block.count("@keyframes fadeIn") == 1, "Identical rules from different chunks must be deduped"
+
+    print("test_regenerate_html_dedupes_identical_style_rules_across_chunks: PASSED")
+
+
 if __name__ == "__main__":
     test_happy_path_publishes_all_steps()
     test_openai_failure_publishes_failed()
@@ -732,4 +799,6 @@ if __name__ == "__main__":
     test_none_theme_does_not_leak_into_prompt()
     test_regenerate_html_reassembles_style_block_with_import_before_other_rules()
     test_regenerate_html_raw_fallback_returns_model_output_directly()
+    test_regenerate_html_raw_fallback_extracts_style_comment_into_style_block()
+    test_regenerate_html_dedupes_identical_style_rules_across_chunks()
     print("All tests passed.")

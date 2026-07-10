@@ -19,6 +19,16 @@ def _extract_img_srcs(html: str) -> set[str]:
     return set(_IMG_SRC_RE.findall(html))
 
 
+def _build_style_block(style_rules: list[str]) -> str:
+    # @import must precede all other rules per the CSS spec. Rules are deduped
+    # (preserving first-seen order) since independently-regenerated chunks can
+    # emit identical imports or hover/keyframe rules.
+    import_rules = list(dict.fromkeys(r for r in style_rules if r.startswith("@import")))
+    other_rules = list(dict.fromkeys(r for r in style_rules if not r.startswith("@import")))
+    joined_rules = "\n".join(import_rules + other_rules)
+    return f"<style>\n{joined_rules}\n</style>"
+
+
 def _regenerate_chunk(
     client: OpenAI,
     chunk: str,
@@ -149,7 +159,12 @@ def regenerate_html(
                 on_chunk_complete(idx, len(chunks))
 
     if labels[0] == "raw":
-        return results[0]
+        raw_html = results[0]
+        style_rules = [m.strip() for m in _STYLE_COMMENT_RE.findall(raw_html) if m.strip()]
+        cleaned_html = _STYLE_COMMENT_RE.sub("", raw_html)
+        if style_rules:
+            return f"{_build_style_block(style_rules)}\n{cleaned_html}"
+        return cleaned_html
 
     head_content = results[0]
     body_parts = [results[i] for i in range(1, len(chunks))]
@@ -160,15 +175,7 @@ def regenerate_html(
         style_rules.extend(m.strip() for m in _STYLE_COMMENT_RE.findall(part) if m.strip())
         cleaned_body_parts.append(_STYLE_COMMENT_RE.sub("", part))
 
-    if style_rules:
-        # @import must precede all other rules per the CSS spec, and duplicate
-        # imports of the same font across chunks are wasted requests.
-        import_rules = list(dict.fromkeys(r for r in style_rules if r.startswith("@import")))
-        other_rules = [r for r in style_rules if not r.startswith("@import")]
-        joined_rules = "\n".join(import_rules + other_rules)
-        style_block = f"\n<style>\n{joined_rules}\n</style>"
-    else:
-        style_block = ""
+    style_block = f"\n{_build_style_block(style_rules)}" if style_rules else ""
 
     return (
         f"<!DOCTYPE html>\n<html>\n"
