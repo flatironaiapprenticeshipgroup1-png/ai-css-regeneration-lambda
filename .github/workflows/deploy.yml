@@ -15,7 +15,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install test dependencies
-        run: pip install boto3 openai ably
+        run: pip install boto3 openai ably premailer beautifulsoup4
 
       - name: Run handler tests
         run: python test_handler.py
@@ -35,6 +35,8 @@ jobs:
         run: |
           pip install ably \
             openai \
+            premailer \
+            beautifulsoup4 \
             --target ./package \
             --platform manylinux2014_x86_64 \
             --python-version 3.14 \

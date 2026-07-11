@@ -114,9 +114,23 @@ def make_mocks():
                 mock_ably_channel, mock_ably_rest, mock_openai, boto3_client_factory)
     """
     mock_s3 = MagicMock()
-    mock_s3.get_object.return_value = {
-        "Body": MagicMock(read=lambda: b"body { color: red; }")
+    s3_objects = {
+        f"{WEBSITE_ID}/original-styles.css": b"body { color: red; }",
+        f"{WEBSITE_ID}/index.html": (
+            b"<html><head><style>old</style>"
+            b"<link rel=\"stylesheet\" href=\"old.css\">"
+            b"<meta property=\"og:title\" content=\"x\">"
+            b"</head><body><img src=\"/a.jpg\"><p class=\"hero\">Hi</p></body></html>"
+        ),
+        f"{WEBSITE_ID}/image-map.json": json.dumps(
+            {"https://example.com/a.jpg": "./images/img-0.jpg"}
+        ).encode("utf-8"),
     }
+
+    def s3_get_object(Bucket, Key):
+        return {"Body": MagicMock(read=lambda: s3_objects[Key])}
+
+    mock_s3.get_object.side_effect = s3_get_object
 
     # Low-level DynamoDB client used by status_publisher
     mock_dynamodb_client = MagicMock()
@@ -189,6 +203,7 @@ EXPECTED_STEPS = [
     "chunking",
     "regenerating_css",
     "regenerating_css_chunks_completed",
+    "creating_inline_html",
     "Finalizing",
 ]
 
@@ -234,9 +249,22 @@ def test_happy_path_publishes_all_steps():
     last = mock_channel.publish.call_args_list[-1].args[1]
     assert last["status"] == "completed"
 
-    assert mock_s3.put_object.call_count == 1
-    key = mock_s3.put_object.call_args.kwargs["Key"]
-    assert key == f"{WEBSITE_ID}/Regenerated-Styles.css"
+    assert mock_s3.put_object.call_count == 2
+    put_keys = [c.kwargs["Key"] for c in mock_s3.put_object.call_args_list]
+    assert f"{WEBSITE_ID}/Regenerated-Styles.css" in put_keys
+    assert f"{WEBSITE_ID}/Regenerated-Index.html" in put_keys
+
+    inline_html_call = next(
+        c for c in mock_s3.put_object.call_args_list
+        if c.kwargs["Key"] == f"{WEBSITE_ID}/Regenerated-Index.html"
+    )
+    inline_html = inline_html_call.kwargs["Body"].decode("utf-8")
+    assert "./images/img-0.jpg" in inline_html
+    assert "<style>old</style>" not in inline_html
+    assert "og:title" not in inline_html
+    assert "old.css" not in inline_html
+    assert "style=" in inline_html
+    assert 'class="hero"' in inline_html
 
     # status_publisher's update_item called once per Ably publish
     assert mock_dynamodb_client.update_item.call_count == len(EXPECTED_STEPS)
@@ -463,11 +491,81 @@ def test_events_use_ai_phase():
     print("test_events_use_ai_phase: PASSED")
 
 
+def test_clean_html_for_inline_css():
+    """Verify head cleanup rules replicated from the old crawler html_regenerator.py."""
+    from lambda_function import clean_html_for_inline_css
+
+    html = (
+        "<html><head>"
+        "<style>body{color:red}</style>"
+        "<noscript>no js</noscript>"
+        "<link rel=\"stylesheet\" href=\"a.css\">"
+        "<link rel=\"canonical\" href=\"https://example.com\">"
+        "<meta property=\"og:title\" content=\"x\">"
+        "<meta name=\"twitter:card\" content=\"x\">"
+        "<meta http-equiv=\"refresh\" content=\"5\">"
+        "<meta name=\"robots\" content=\"noindex\">"
+        "<meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width\">"
+        "</head>"
+        "<body><style>body{color:blue}</style><script>console.log(1)</script>"
+        "<p class=\"hero\">Hi</p></body></html>"
+    )
+
+    cleaned = clean_html_for_inline_css(html)
+
+    assert "color:red" not in cleaned
+    assert "no js" not in cleaned
+    assert 'href="a.css"' not in cleaned
+    assert 'rel="canonical"' not in cleaned
+    assert "og:title" not in cleaned
+    assert "twitter:card" not in cleaned
+    assert "http-equiv" not in cleaned
+    assert 'name="robots"' not in cleaned
+    assert 'charset="utf-8"' in cleaned
+    assert 'name="viewport"' in cleaned
+
+    # Body is untouched: its <style> and <script> tags are preserved.
+    assert "color:blue" in cleaned
+    assert "console.log(1)" in cleaned
+    assert 'class="hero"' in cleaned
+
+    print("test_clean_html_for_inline_css: PASSED")
+
+
+def test_rewrite_image_sources():
+    """Verify image src rewriting against a cached image map."""
+    from lambda_function import rewrite_image_sources
+
+    base_url = "https://example.com"
+    image_map = {"https://example.com/a.jpg": "./images/img-0.jpg"}
+
+    html = (
+        "<html><body>"
+        "<img src=\"/a.jpg\">"
+        "<img src=\"https://example.com/a.jpg\">"
+        "<img src=\"https://example.com/unmapped.jpg\">"
+        "<img src=\"data:image/png;base64,AAAA\">"
+        "</body></html>"
+    )
+
+    rewritten = rewrite_image_sources(html, base_url, image_map)
+
+    assert 'src="./images/img-0.jpg"' in rewritten
+    assert 'src="https://example.com/unmapped.jpg"' in rewritten
+    assert 'src="data:image/png;base64,AAAA"' in rewritten
+    assert rewritten.count("./images/img-0.jpg") == 2
+
+    print("test_rewrite_image_sources: PASSED")
+
+
 if __name__ == "__main__":
     test_happy_path_publishes_all_steps()
     test_openai_failure_publishes_failed()
     test_s3_write_failure_publishes_failed()
     test_sequence_numbers_always_increase()
     test_sequence_continues_from_crawler()
+    test_clean_html_for_inline_css()
+    test_rewrite_image_sources()
     test_events_use_ai_phase()
     print("All tests passed.")

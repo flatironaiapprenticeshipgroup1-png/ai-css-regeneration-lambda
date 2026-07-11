@@ -3,15 +3,72 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin
 from status_publisher import get_current_sequence, publish_status_update
 
 import boto3
+from botocore.exceptions import ClientError
+from bs4 import BeautifulSoup
 from openai import OpenAI
+from premailer import transform
 
 s3 = boto3.client("s3")
 secrets_client = boto3.client("secretsmanager")
 dynamodb = boto3.resource("dynamodb")
 MAX_CHARS_PER_CHUNK = 30_000
+
+_HEAD_LINK_RELS_TO_STRIP = {
+    "preload",
+    "prefetch",
+    "dns-prefetch",
+    "preconnect",
+    "canonical",
+    "alternate",
+    "manifest",
+    "stylesheet",
+}
+
+
+def clean_html_for_inline_css(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    head = soup.find("head")
+
+    if head:
+        for tag in head.find_all(["style", "noscript"]):
+            tag.decompose()
+
+        for tag in head.find_all("link"):
+            rel_values = tag.get("rel", [])
+            if isinstance(rel_values, str):
+                rel_values = rel_values.split()
+            rel = " ".join(rel_values).lower()
+            if rel in _HEAD_LINK_RELS_TO_STRIP:
+                tag.decompose()
+
+        for tag in head.find_all("meta"):
+            prop = tag.get("property", "")
+            name = tag.get("name", "").lower()
+            http_equiv = tag.get("http-equiv", "")
+            if (
+                prop.startswith("og:")
+                or name.startswith("twitter:")
+                or http_equiv
+                or name == "robots"
+            ):
+                tag.decompose()
+
+    return str(soup)
+
+
+def rewrite_image_sources(html: str, base_url: str, image_map: dict[str, str]) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for img in soup.find_all("img"):
+        src = img.get("src", "")
+        if not src or src.startswith("data:"):
+            continue
+        absolute = urljoin(base_url, src)
+        img["src"] = image_map.get(absolute, absolute)
+    return str(soup)
 
 def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
     blocks = []
@@ -102,7 +159,7 @@ def lambda_handler(event, context):
                 Key={"RegeneratedWebsiteId": website_id, "RegeneratedWebsiteUrl": website_url}
             ).get("Item", {})
             current_status = existing.get("RegenerationStatus")
-            if current_status in ("ai_lambda_processing", "completed"):
+            if current_status in ("processing", "completed"):
                 print(f"Skipping duplicate invocation for {website_id}: status is already '{current_status}'")
                 continue
 
@@ -198,7 +255,7 @@ def lambda_handler(event, context):
 
                 publish(
                     step=f"regenerating_css_chunks_completed",
-                    status="ai_lambda_processing",
+                    status="processing",
                     message=f"Regenerated chunk {chunk_index + 1} of {total_chunks}"
                 )
                 return response.choices[0].message.content
@@ -221,13 +278,13 @@ def lambda_handler(event, context):
                 )
 
             # Split into chunks if the file is large
-            publish(step="chunking", status="ai_lambda_processing", message="Compressing CSS into chunks for processing")
+            publish(step="chunking", status="processing", message="Compressing CSS into chunks for processing")
             chunks = split_css_into_chunks(content)
             print(f"Split CSS into {len(chunks)} chunk(s) for processing")
 
             # process all chunks in parallel (I/O-bound — threads wait on OpenAI, not CPU)
             results = {}
-            publish(step="regenerating_css", status="ai_lambda_processing", message="Ai Regenerating Styling CSS for the website")
+            publish(step="regenerating_css", status="processing", message="Ai Regenerating Styling CSS for the website")
             with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
                 futures = {
                     executor.submit(regenerate_css_chunk, client, chunk, theme_prompt, i, len(chunks)): i
@@ -251,6 +308,48 @@ def lambda_handler(event, context):
             )
             print(f"Regenerated CSS saved to S3 for website ID {website_id}")
 
+            publish(step="creating_inline_html", status="processing", message="Creating final inline HTML")
+
+            html_response = s3.get_object(
+                Bucket=os.environ["BUCKET_NAME"],
+                Key=f"{website_id}/index.html",
+            )
+            original_html = html_response["Body"].read().decode("utf-8")
+
+            try:
+                image_map_response = s3.get_object(
+                    Bucket=os.environ["BUCKET_NAME"],
+                    Key=f"{website_id}/image-map.json",
+                )
+                image_map = json.loads(image_map_response["Body"].read().decode("utf-8"))
+            except ClientError as exc:
+                error_code = exc.response.get("Error", {}).get("Code")
+                if error_code in {"NoSuchKey", "404"}:
+                    image_map = {}
+                else:
+                    raise
+
+            html_with_local_images = rewrite_image_sources(original_html, website_url, image_map)
+            cleaned_html = clean_html_for_inline_css(html_with_local_images)
+            inline_html = transform(
+                cleaned_html,
+                css_text=regenerated_css,
+                remove_classes=False,
+                keep_style_tags=False,
+                disable_leftover_css=False,
+                strip_important=False,
+                allow_network=False,
+            )
+
+            s3.put_object(
+                Bucket=os.environ["BUCKET_NAME"],
+                Key=f"{website_id}/Regenerated-Index.html",
+                Body=inline_html.encode("utf-8"),
+                ContentType="text/html; charset=utf-8",
+                CacheControl="no-store, no-cache, must-revalidate",
+            )
+            print(f"Regenerated inline HTML saved to S3 for website ID {website_id}")
+
             table.update_item(
                 Key={
                     "RegeneratedWebsiteId": website_id,
@@ -260,7 +359,7 @@ def lambda_handler(event, context):
                 ExpressionAttributeValues={":status": "completed"},
             )
             print(f"DynamoDB status updated to completed for website ID {website_id}")
-            publish(step="Finalizing", status="completed", message="Finished Css Regeneration")
+            publish(step="Finalizing", status="completed", message="Finished CSS regeneration and inline HTML creation")
 
         except Exception as e:
             print(f"Error processing record for {website_id}: {e}")
