@@ -72,7 +72,7 @@ def lambda_handler(event, context):
 
             def on_chunk_complete(chunk_index, total_chunks):
                 publish(
-                    step="regenerating_html_chunks_completed",
+                    step="regenerating_html_and_styling_chunks_completed",
                     status="ai_lambda_processing",
                     message=f"Regenerated chunk {chunk_index + 1} of {total_chunks}"
                 )
@@ -94,7 +94,7 @@ def lambda_handler(event, context):
                 )
 
             publish(step="chunking", status="ai_lambda_processing", message="Compressing HTML into chunks for processing")
-            publish(step="regenerating_html", status="ai_lambda_processing", message="Ai Regenerating HTML and styling for the website")
+            publish(step="regenerating_html_and_styling", status="ai_lambda_processing", message="Ai Regenerating HTML and styling for the website")
             regenerated_html = regenerate_html(client, content, theme_prompt, regeneration_theme, on_chunk_complete)
             print(f"Regenerated HTML total size: {len(regenerated_html)} characters")
 
