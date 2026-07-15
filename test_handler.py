@@ -192,11 +192,11 @@ def _clear_modules():
 
 # Expected publish steps for the default mock HTML, which has a single top-level
 # <body> child. split_html_into_chunks returns [head, body-div], and the head chunk
-# doesn't go through the model, so there's exactly one "regenerating_html_chunks_completed" event.
+# doesn't go through the model, so there's exactly one "regenerating_html_and_styling_chunks_completed" event.
 EXPECTED_STEPS = [
     "chunking",
-    "regenerating_html",
-    "regenerating_html_chunks_completed",
+    "regenerating_html_and_styling",
+    "regenerating_html_and_styling_chunks_completed",
     "Finalizing",
 ]
 
@@ -260,7 +260,7 @@ def test_openai_failure_publishes_failed():
     """
     Verify that an OpenAI error causes batchItemFailures to be returned and a
     "failed" Ably event to be published.
-    Steps published before the failure (chunking, regenerating_html) are present;
+    Steps published before the failure (chunking, regenerating_html_and_styling) are present;
     Finalizing is not published since the error short-circuits the handler.
     """
     (
@@ -289,7 +289,7 @@ def test_openai_failure_publishes_failed():
 
     steps = [c.args[1]["step"] for c in mock_channel.publish.call_args_list]
     assert "chunking" in steps
-    assert "regenerating_html" in steps
+    assert "regenerating_html_and_styling" in steps
     assert "Finalizing" not in steps
     assert "failed" in steps
 
@@ -305,7 +305,7 @@ def test_s3_write_failure_publishes_failed():
     Verify that an S3 write error causes batchItemFailures to be returned and a
     "failed" Ably event to be published.
     The HTML chunks are regenerated successfully before the write fails, so
-    regenerating_html_chunks_completed is published but Finalizing is not.
+    regenerating_html_and_styling_chunks_completed is published but Finalizing is not.
     """
     (
         mock_s3,
