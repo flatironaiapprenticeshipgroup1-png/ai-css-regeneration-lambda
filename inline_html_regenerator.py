@@ -12,11 +12,44 @@ MAX_CONCURRENT_CHUNK_REQUESTS = 10
 # those can't be expressed as inline style="..." attributes; collected and
 # assembled into one <style> block.
 _STYLE_COMMENT_RE = re.compile(r"<!--STYLE:(.*?)-->", re.DOTALL)
-_IMG_SRC_RE = re.compile(r'<img\b[^>]*\bsrc=["\']([^"\']+)["\']', re.IGNORECASE)
+# (?<![\w-]) rather than \b: \b alone also matches inside "data-src=" (the
+# '-'->'s' transition is a word boundary), which would validate the img-src
+# safety check below against the wrong attribute on lazy-loaded images.
+_IMG_SRC_RE = re.compile(r'<img\b[^>]*(?<![\w-])src=["\']([^"\']+)["\']', re.IGNORECASE)
+# Identifiers the model may introduce inside a <!--STYLE:...--> comment for a
+# hover/animation hook — used to namespace them per chunk (see
+# _namespace_chunk_style_identifiers) so two independently-regenerated chunks
+# can never collide on the same class/keyframe name.
+_STYLE_CLASS_SELECTOR_RE = re.compile(r"\.([A-Za-z_][A-Za-z0-9_-]*)")
+_KEYFRAMES_NAME_RE = re.compile(r"@keyframes\s+([A-Za-z_][A-Za-z0-9_-]*)")
 
 
 def _extract_img_srcs(html: str) -> set[str]:
     return set(_IMG_SRC_RE.findall(html))
+
+
+def _namespace_chunk_style_identifiers(regenerated_html: str, chunk_index: int) -> str:
+    """Renames model-introduced hook classes and @keyframes names found inside
+    the trailing <!--STYLE:...--> comment by suffixing them with the chunk
+    index, so two independently-regenerated chunks can never collide on the
+    same hook class/animation name. Renames every occurrence of each
+    identifier throughout regenerated_html (class= attributes, animation/
+    animation-name references, and the STYLE comment itself)."""
+    match = _STYLE_COMMENT_RE.search(regenerated_html)
+    if not match:
+        return regenerated_html
+
+    style_content = match.group(1)
+    identifiers = set(_STYLE_CLASS_SELECTOR_RE.findall(style_content)) | set(
+        _KEYFRAMES_NAME_RE.findall(style_content)
+    )
+    if not identifiers:
+        return regenerated_html
+
+    renamed = regenerated_html
+    for name in identifiers:
+        renamed = re.sub(rf"(?<![\w-]){re.escape(name)}(?![\w-])", f"{name}-c{chunk_index}", renamed)
+    return renamed
 
 
 def _build_style_block(style_rules: list[str]) -> str:
@@ -123,7 +156,7 @@ def _regenerate_chunk(
         )
         return chunk
 
-    return regenerated_html
+    return _namespace_chunk_style_identifiers(regenerated_html, chunk_index)
 
 
 def regenerate_html(
@@ -159,9 +192,15 @@ def regenerate_html(
                 on_chunk_complete(idx, len(chunks))
 
     if labels[0] == "raw":
-        raw_html = results[0]
-        style_rules = [m.strip() for m in _STYLE_COMMENT_RE.findall(raw_html) if m.strip()]
-        cleaned_html = _STYLE_COMMENT_RE.sub("", raw_html)
+        # split_html_into_chunks labels every chunk "raw" together, never
+        # mixed with "head"/"body" — there can be one or more of them.
+        style_rules = []
+        cleaned_parts = []
+        for i in range(len(chunks)):
+            part = results[i]
+            style_rules.extend(m.strip() for m in _STYLE_COMMENT_RE.findall(part) if m.strip())
+            cleaned_parts.append(_STYLE_COMMENT_RE.sub("", part))
+        cleaned_html = "".join(cleaned_parts)
         if style_rules:
             return f"{_build_style_block(style_rules)}\n{cleaned_html}"
         return cleaned_html

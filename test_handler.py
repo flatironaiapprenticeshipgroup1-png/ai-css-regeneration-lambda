@@ -70,8 +70,10 @@ with patch("boto3.client", side_effect=_boto3_client_factory), patch(
 ), patch("openai.OpenAI", return_value=_mock_openai_client):
     from lambda_function import lambda_handler
 
-from html_chunker import split_html_into_chunks
-from inline_html_regenerator import regenerate_html
+from bs4 import BeautifulSoup
+
+from html_chunker import split_html_into_chunks, split_node_into_parts
+from inline_html_regenerator import _extract_img_srcs, regenerate_html
 
 
 def make_event(website_id=WEBSITE_ID, url=URL, theme="cyberpunk"):
@@ -518,6 +520,45 @@ def test_split_html_into_chunks_packs_body_children_within_max_chars():
     print("test_split_html_into_chunks_packs_body_children_within_max_chars: PASSED")
 
 
+def test_split_node_into_parts_preserves_wrapping_tag_when_splitting():
+    """Splitting an oversized element must keep its own tag/attributes on every
+    resulting part — dropping them corrupts structure."""
+    inner = "".join(f"<p>{'p' * 20}</p>" for _ in range(20))
+    soup = BeautifulSoup(f'<div class="wrap" data-x="y">{inner}</div>', "html.parser")
+    div = soup.find("div")
+
+    parts = split_node_into_parts(div, max_chars=100)
+
+    assert len(parts) > 1, "Expected the oversized div to be split into multiple parts"
+    for part in parts:
+        assert part.startswith('<div class="wrap" data-x="y">')
+        assert part.endswith("</div>")
+
+    reconstructed = "".join(p[len('<div class="wrap" data-x="y">') : -len("</div>")] for p in parts)
+    assert reconstructed == inner, "Splitting must not lose or duplicate content"
+
+    print("test_split_node_into_parts_preserves_wrapping_tag_when_splitting: PASSED")
+
+
+def test_split_node_into_parts_preserves_script_tag_when_splitting():
+    """An oversized <script> tag must stay wrapped in <script>...</script> when
+    split — previously the wrapping tag was dropped entirely, turning the JS
+    body into inert text on the page."""
+    long_js = "console.log('x');" * 50
+    soup = BeautifulSoup(f"<script>{long_js}</script>", "html.parser")
+    script = soup.find("script")
+
+    parts = split_node_into_parts(script, max_chars=100)
+
+    assert parts, "Expected at least one part"
+    for part in parts:
+        assert part.startswith("<script>") and part.endswith(
+            "</script>"
+        ), f"Script content must stay wrapped in its own tag, got: {part!r}"
+
+    print("test_split_node_into_parts_preserves_script_tag_when_splitting: PASSED")
+
+
 def test_split_html_into_chunks_falls_back_to_raw_without_head_or_body():
     """Documents that can't be parsed into head/body fall back to a single raw chunk."""
     html = "<div>not a full document</div>"
@@ -525,6 +566,39 @@ def test_split_html_into_chunks_falls_back_to_raw_without_head_or_body():
     assert labels == ["raw"]
     assert chunks == [html]
     print("test_split_html_into_chunks_falls_back_to_raw_without_head_or_body: PASSED")
+
+
+def test_split_html_into_chunks_splits_large_document_without_head_or_body():
+    """A large fragment that can't be parsed into head/body must still respect
+    max_chars — previously the whole document shipped as one unsplit chunk,
+    reintroducing the oversized-request timeout this chunking exists to fix."""
+    html = f'<div class="a">{"x" * 50}</div>' f'<div class="b">{"y" * 50}</div>'
+    chunks, labels = split_html_into_chunks(html, max_chars=60)
+    assert labels == ["raw", "raw"]
+    assert all(len(c) <= 60 for c in chunks)
+    assert 'class="a"' in chunks[0]
+    assert 'class="b"' in chunks[1]
+    print("test_split_html_into_chunks_splits_large_document_without_head_or_body: PASSED")
+
+
+def test_split_html_into_chunks_strips_stale_stylesheet_link_without_head_or_body():
+    """The stale Regenerated-Styles.css link must be stripped even when the
+    document doesn't parse into a clean head/body shape."""
+    html = '<link rel="stylesheet" href="./Regenerated-Styles.css"><div>Hi</div>'
+    chunks, labels = split_html_into_chunks(html)
+    assert labels == ["raw"]
+    assert "Regenerated-Styles.css" not in "".join(chunks)
+    print("test_split_html_into_chunks_strips_stale_stylesheet_link_without_head_or_body: PASSED")
+
+
+def test_extract_img_srcs_ignores_data_src_attribute():
+    """The img-src regex must not match inside a data-src attribute (used for
+    lazy-loaded images) — matching it would validate the img-preservation
+    safety check against the wrong URL."""
+    assert _extract_img_srcs('<img data-src="lazy.jpg" src="placeholder.jpg">') == {"placeholder.jpg"}
+    assert _extract_img_srcs('<img src="real.jpg" data-src="lazy.jpg">') == {"real.jpg"}
+    assert _extract_img_srcs('<img srcset="a.jpg 1x, b.jpg 2x" src="real.jpg">') == {"real.jpg"}
+    print("test_extract_img_srcs_ignores_data_src_attribute: PASSED")
 
 
 def test_regenerate_html_chunk_keeps_original_when_model_returns_empty():
@@ -690,8 +764,10 @@ def test_regenerate_html_reassembles_style_block_with_import_before_other_rules(
     assert result.count("<style>") == 1
     style_block = result.split("<style>")[1].split("</style>")[0]
     assert style_block.strip().startswith("@import"), "@import must precede other rules"
-    assert ".chunk-a-hover:hover{color:gold}" in style_block
-    assert "@keyframes pulse" in style_block
+    # Hook identifiers get suffixed with the chunk index (here, chunk 1) so
+    # they can never collide with another chunk's independently-chosen names.
+    assert ".chunk-a-hover-c1:hover{color:gold}" in style_block
+    assert "@keyframes pulse-c1{0%{opacity:1}}" in style_block
     assert "<!--STYLE:" not in result, "STYLE comment should be stripped from the body"
     assert 'class="chunk-a"' in result and 'class="chunk-b"' in result
 
@@ -741,16 +817,21 @@ def test_regenerate_html_raw_fallback_extracts_style_comment_into_style_block():
     assert "<!--STYLE:" not in result, "STYLE comment should be stripped from the output"
     assert "<style>" in result and "</style>" in result
     style_block = result.split("<style>")[1].split("</style>")[0]
-    assert "@keyframes pulse" in style_block
-    assert '<div class="pulse">regenerated fragment</div>' in result
+    # The hook class/keyframe name gets suffixed with the chunk index (here,
+    # chunk 0, the only chunk) so it can never collide with another chunk's.
+    assert "@keyframes pulse-c0{0%{opacity:1}}" in style_block
+    assert '<div class="pulse-c0">regenerated fragment</div>' in result
 
     print("test_regenerate_html_raw_fallback_extracts_style_comment_into_style_block: PASSED")
 
 
-def test_regenerate_html_dedupes_identical_style_rules_across_chunks():
-    """Chunks are regenerated independently and in parallel, so two chunks can
-    emit byte-identical hover/keyframe rules (e.g. a shared fade-in animation).
-    The assembled <style> block must not contain duplicate copies."""
+def test_regenerate_html_namespaces_colliding_hover_classes_across_chunks():
+    """Chunks are regenerated independently and in parallel with zero shared
+    context, so two chunks can independently choose the SAME hook class name
+    for DIFFERENT hover rules (e.g. both call it ".hover-lift"). Merging by
+    exact rule text would let both rules ship under one name, with one
+    silently overriding the other in the browser. Each chunk's hook classes
+    must be namespaced so they can never collide."""
     big_a = "a" * 20000
     big_b = "b" * 20000
     html = (
@@ -759,14 +840,19 @@ def test_regenerate_html_dedupes_identical_style_rules_across_chunks():
         f'<div class="chunk-b">{big_b}</div>'
         "</body></html>"
     )
-    shared_rule = "@keyframes fadeIn{0%{opacity:0}100%{opacity:1}}"
 
     def side_effect(**kwargs):
         user_content = kwargs["messages"][1]["content"]
         if "chunk-a" in user_content:
-            content = f'<div class="chunk-a fade-in" style="color:red">A</div><!--STYLE:{shared_rule}-->'
+            content = (
+                '<div class="chunk-a hover-lift" style="color:red">A</div>'
+                "<!--STYLE:.hover-lift:hover{color:gold}-->"
+            )
         else:
-            content = f'<div class="chunk-b fade-in" style="color:blue">B</div><!--STYLE:{shared_rule}-->'
+            content = (
+                '<div class="chunk-b hover-lift" style="color:blue">B</div>'
+                "<!--STYLE:.hover-lift:hover{color:teal}-->"
+            )
         return MagicMock(
             choices=[MagicMock(message=MagicMock(content=content), finish_reason="stop")],
             usage=MagicMock(prompt_tokens=100, completion_tokens=200),
@@ -778,9 +864,94 @@ def test_regenerate_html_dedupes_identical_style_rules_across_chunks():
     result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
 
     style_block = result.split("<style>")[1].split("</style>")[0]
-    assert style_block.count("@keyframes fadeIn") == 1, "Identical rules from different chunks must be deduped"
+    assert style_block.count(":hover{") == 2, "Both chunks' hover rules must survive, not collapse into one"
+    assert ".hover-lift-c1:hover{color:gold}" in style_block
+    assert ".hover-lift-c2:hover{color:teal}" in style_block
+    assert 'class="chunk-a hover-lift-c1"' in result
+    assert 'class="chunk-b hover-lift-c2"' in result
 
-    print("test_regenerate_html_dedupes_identical_style_rules_across_chunks: PASSED")
+    print("test_regenerate_html_namespaces_colliding_hover_classes_across_chunks: PASSED")
+
+
+def test_regenerate_html_namespaces_colliding_keyframes_across_chunks():
+    """Same collision risk as hover classes, but for @keyframes animation
+    names referenced via the animation shorthand — each chunk's keyframes must
+    be namespaced so two different animations sharing a name don't collide."""
+    big_a = "a" * 20000
+    big_b = "b" * 20000
+    html = (
+        "<html><head><title>T</title></head><body>"
+        f'<div class="chunk-a">{big_a}</div>'
+        f'<div class="chunk-b">{big_b}</div>'
+        "</body></html>"
+    )
+
+    def side_effect(**kwargs):
+        user_content = kwargs["messages"][1]["content"]
+        if "chunk-a" in user_content:
+            content = (
+                '<div class="chunk-a" style="color:red;animation:fade-in 1s">A</div>'
+                "<!--STYLE:@keyframes fade-in{0%{opacity:0}100%{opacity:1}}-->"
+            )
+        else:
+            content = (
+                '<div class="chunk-b" style="color:blue;animation:fade-in 2s">B</div>'
+                "<!--STYLE:@keyframes fade-in{0%{opacity:1}100%{opacity:0}}-->"
+            )
+        return MagicMock(
+            choices=[MagicMock(message=MagicMock(content=content), finish_reason="stop")],
+            usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+        )
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = side_effect
+
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+
+    style_block = result.split("<style>")[1].split("</style>")[0]
+    assert "@keyframes fade-in-c1{0%{opacity:0}100%{opacity:1}}" in style_block
+    assert "@keyframes fade-in-c2{0%{opacity:1}100%{opacity:0}}" in style_block
+    assert "animation:fade-in-c1 1s" in result
+    assert "animation:fade-in-c2 2s" in result
+
+    print("test_regenerate_html_namespaces_colliding_keyframes_across_chunks: PASSED")
+
+
+def test_regenerate_html_merges_multiple_raw_chunks():
+    """When head/body can't be parsed and the document is large enough to
+    split into multiple raw chunks, regenerate_html must concatenate all of
+    them (not just the first) and still extract any STYLE comment into a
+    single <style> block."""
+    big_a = "a" * 20000
+    big_b = "b" * 20000
+    html = f'<div class="a">{big_a}</div><div class="b">{big_b}</div>'
+
+    chunks, labels = split_html_into_chunks(html)
+    assert labels == ["raw", "raw"], "Test setup expects the fragment to split into two raw chunks"
+
+    def side_effect(**kwargs):
+        user_content = kwargs["messages"][1]["content"]
+        if 'class="a"' in user_content:
+            content = '<div class="a fade">A regenerated</div><!--STYLE:@keyframes fade{0%{opacity:0}}-->'
+        else:
+            content = '<div class="b">B regenerated</div>'
+        return MagicMock(
+            choices=[MagicMock(message=MagicMock(content=content), finish_reason="stop")],
+            usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+        )
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = side_effect
+
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+
+    assert "A regenerated" in result and "B regenerated" in result
+    assert "<!--STYLE:" not in result
+    assert "<style>" in result and "</style>" in result
+    style_block = result.split("<style>")[1].split("</style>")[0]
+    assert "@keyframes fade-c0" in style_block
+
+    print("test_regenerate_html_merges_multiple_raw_chunks: PASSED")
 
 
 if __name__ == "__main__":
@@ -793,12 +964,19 @@ if __name__ == "__main__":
     test_split_html_into_chunks_labels_head_and_body()
     test_split_html_into_chunks_strips_stale_stylesheet_link()
     test_split_html_into_chunks_packs_body_children_within_max_chars()
+    test_split_node_into_parts_preserves_wrapping_tag_when_splitting()
+    test_split_node_into_parts_preserves_script_tag_when_splitting()
     test_split_html_into_chunks_falls_back_to_raw_without_head_or_body()
+    test_split_html_into_chunks_splits_large_document_without_head_or_body()
+    test_split_html_into_chunks_strips_stale_stylesheet_link_without_head_or_body()
+    test_extract_img_srcs_ignores_data_src_attribute()
     test_regenerate_html_chunk_keeps_original_when_model_returns_empty()
     test_regenerate_html_chunk_keeps_original_when_model_drops_image()
     test_none_theme_does_not_leak_into_prompt()
     test_regenerate_html_reassembles_style_block_with_import_before_other_rules()
     test_regenerate_html_raw_fallback_returns_model_output_directly()
     test_regenerate_html_raw_fallback_extracts_style_comment_into_style_block()
-    test_regenerate_html_dedupes_identical_style_rules_across_chunks()
+    test_regenerate_html_namespaces_colliding_hover_classes_across_chunks()
+    test_regenerate_html_namespaces_colliding_keyframes_across_chunks()
+    test_regenerate_html_merges_multiple_raw_chunks()
     print("All tests passed.")
