@@ -183,6 +183,8 @@ def _regenerate_chunk(
             Preserve every <img> src attribute exactly as given — do not invent, replace, or omit image URLs,
             Do not change width, height, max-width, max-height, object-fit, or aspect-ratio on img, picture, svg, video, or canvas elements,
             Preserve all factual content (text, product names, prices) and emojis exactly as they appear,
+            Do not change the sizes of images
+            Do not change svg's to images or vice versa
             The transformation must be immediately obvious at a glance"""
     )
     user_msg = (
