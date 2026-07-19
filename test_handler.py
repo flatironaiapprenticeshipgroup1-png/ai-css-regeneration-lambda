@@ -73,7 +73,12 @@ with patch("boto3.client", side_effect=_boto3_client_factory), patch(
 from bs4 import BeautifulSoup
 
 from html_chunker import split_html_into_chunks, split_node_into_parts
-from inline_html_regenerator import _extract_img_srcs, regenerate_html
+from inline_html_regenerator import (
+    _extract_img_data_srcs,
+    _extract_img_srcs,
+    _hook_class_candidates,
+    regenerate_html,
+)
 
 
 def make_event(website_id=WEBSITE_ID, url=URL, theme="cyberpunk"):
@@ -516,7 +521,14 @@ def test_split_html_into_chunks_packs_body_children_within_max_chars():
         "</body></html>"
     )
     small_chunks, small_labels = split_html_into_chunks(big_html, max_chars=60)
-    assert small_labels == ["head", "body", "body"]
+    # A child exceeding max_chars now splits into as many pieces as needed to
+    # preserve all its content (rather than being truncated into a single
+    # chunk), so it starts one or more new chunks, not exactly one.
+    assert small_labels[0] == "head"
+    assert small_labels[1:] == ["body"] * (len(small_labels) - 1)
+    assert len(small_labels) > 3
+    reconstructed_body = "".join(small_chunks[1:])
+    assert reconstructed_body.count("x") == 50 and reconstructed_body.count("y") == 50
     print("test_split_html_into_chunks_packs_body_children_within_max_chars: PASSED")
 
 
@@ -559,6 +571,41 @@ def test_split_node_into_parts_preserves_script_tag_when_splitting():
     print("test_split_node_into_parts_preserves_script_tag_when_splitting: PASSED")
 
 
+def test_split_node_into_parts_splits_oversized_leaf_without_dropping_content():
+    """A leaf node (e.g. the text inside a <script>) that alone exceeds
+    max_chars must be split into multiple pieces, not silently truncated to
+    one max_chars piece with the remainder discarded."""
+    long_js = "console.log('x');" * 50
+    soup = BeautifulSoup(f"<script>{long_js}</script>", "html.parser")
+    script = soup.find("script")
+
+    parts = split_node_into_parts(script, max_chars=100)
+
+    assert len(parts) > 1
+    reconstructed = "".join(p[len("<script>") : -len("</script>")] for p in parts)
+    assert reconstructed == long_js, "No JS content should be silently dropped"
+
+    print("test_split_node_into_parts_splits_oversized_leaf_without_dropping_content: PASSED")
+
+
+def test_split_html_into_chunks_splits_oversized_head_into_multiple_head_chunks():
+    """A <head> that alone exceeds max_chars must be split into multiple
+    'head'-labeled chunks, not silently truncated."""
+    long_meta = "".join(f'<meta name="tag{i}" content="{"x" * 20}">' for i in range(20))
+    html = f"<html><head>{long_meta}</head><body><div>Hi</div></body></html>"
+
+    chunks, labels = split_html_into_chunks(html, max_chars=100)
+
+    head_indices = [i for i, label in enumerate(labels) if label == "head"]
+    assert len(head_indices) > 1
+    assert labels[len(head_indices) :] == ["body"] * (len(labels) - len(head_indices))
+    reconstructed_head = "".join(chunks[i] for i in head_indices)
+    for i in range(20):
+        assert f'name="tag{i}"' in reconstructed_head
+
+    print("test_split_html_into_chunks_splits_oversized_head_into_multiple_head_chunks: PASSED")
+
+
 def test_split_html_into_chunks_falls_back_to_raw_without_head_or_body():
     """Documents that can't be parsed into head/body fall back to a single raw chunk."""
     html = "<div>not a full document</div>"
@@ -574,10 +621,11 @@ def test_split_html_into_chunks_splits_large_document_without_head_or_body():
     reintroducing the oversized-request timeout this chunking exists to fix."""
     html = f'<div class="a">{"x" * 50}</div>' f'<div class="b">{"y" * 50}</div>'
     chunks, labels = split_html_into_chunks(html, max_chars=60)
-    assert labels == ["raw", "raw"]
+    assert labels == ["raw"] * len(labels)
+    assert len(labels) > 1
     assert all(len(c) <= 60 for c in chunks)
-    assert 'class="a"' in chunks[0]
-    assert 'class="b"' in chunks[1]
+    reconstructed = "".join(chunks)
+    assert reconstructed.count("x") == 50 and reconstructed.count("y") == 50
     print("test_split_html_into_chunks_splits_large_document_without_head_or_body: PASSED")
 
 
@@ -689,6 +737,136 @@ def test_regenerate_html_chunk_keeps_original_when_model_drops_image():
     print("test_regenerate_html_chunk_keeps_original_when_model_drops_image: PASSED")
 
 
+def test_extract_img_data_srcs_matches_only_data_src_attribute():
+    """The data-src regex must only match data-src, not src (symmetric to the
+    existing _extract_img_srcs test that data-src doesn't leak into src)."""
+    assert _extract_img_data_srcs('<img data-src="lazy.jpg" src="placeholder.jpg">') == {"lazy.jpg"}
+    assert _extract_img_data_srcs('<img src="real.jpg">') == set()
+    print("test_extract_img_data_srcs_matches_only_data_src_attribute: PASSED")
+
+
+def test_regenerate_html_chunk_keeps_original_when_images_are_swapped():
+    """End-to-end: model returns the same SET of src values but swaps which
+    <img> tag has which — the set-based check alone would miss this, so a
+    position-preserved check must catch it and keep the original chunk."""
+    (
+        mock_s3,
+        _,
+        _,
+        mock_dynamodb_resource,
+        mock_channel,
+        mock_ably_rest,
+        mock_openai,
+        boto3_client_factory,
+    ) = make_mocks()
+    mock_s3.get_object.return_value = {
+        "Body": MagicMock(
+            read=lambda: b'<html><head></head><body>'
+            b'<img src="cat.jpg"><img src="dog.jpg">'
+            b"</body></html>"
+        )
+    }
+    mock_openai.chat.completions.create.return_value = MagicMock(
+        choices=[
+            MagicMock(
+                message=MagicMock(content='<img src="dog.jpg"><img src="cat.jpg">'),
+                finish_reason="stop",
+            )
+        ],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+    _clear_modules()
+
+    with patch("boto3.client", side_effect=boto3_client_factory), patch(
+        "boto3.resource", return_value=mock_dynamodb_resource
+    ), patch("ably.AblyRest", return_value=mock_ably_rest), patch(
+        "openai.OpenAI", return_value=mock_openai
+    ):
+        import lambda_function
+
+        result = lambda_function.lambda_handler(make_event(), {})
+
+    assert result == {"batchItemFailures": []}
+
+    written_html = mock_s3.put_object.call_args.kwargs["Body"].decode("utf-8")
+    assert written_html.index('src="cat.jpg"') < written_html.index(
+        'src="dog.jpg"'
+    ), "Original order must be restored; swapped output must be rejected"
+
+    print("test_regenerate_html_chunk_keeps_original_when_images_are_swapped: PASSED")
+
+
+def test_regenerate_html_chunk_keeps_original_when_data_src_altered():
+    """End-to-end: src is preserved but data-src (the real lazy-load URL) is
+    altered — must be detected even though the existing src-only check passes."""
+    (
+        mock_s3,
+        _,
+        _,
+        mock_dynamodb_resource,
+        mock_channel,
+        mock_ably_rest,
+        mock_openai,
+        boto3_client_factory,
+    ) = make_mocks()
+    mock_s3.get_object.return_value = {
+        "Body": MagicMock(
+            read=lambda: b'<html><head></head><body>'
+            b'<img data-src="real.jpg" src="placeholder.jpg">'
+            b"</body></html>"
+        )
+    }
+    mock_openai.chat.completions.create.return_value = MagicMock(
+        choices=[
+            MagicMock(
+                message=MagicMock(content='<img data-src="wrong.jpg" src="placeholder.jpg">'),
+                finish_reason="stop",
+            )
+        ],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+    _clear_modules()
+
+    with patch("boto3.client", side_effect=boto3_client_factory), patch(
+        "boto3.resource", return_value=mock_dynamodb_resource
+    ), patch("ably.AblyRest", return_value=mock_ably_rest), patch(
+        "openai.OpenAI", return_value=mock_openai
+    ):
+        import lambda_function
+
+        result = lambda_function.lambda_handler(make_event(), {})
+
+    assert result == {"batchItemFailures": []}
+
+    written_html = mock_s3.put_object.call_args.kwargs["Body"].decode("utf-8")
+    assert 'data-src="real.jpg"' in written_html
+    assert 'data-src="wrong.jpg"' not in written_html
+
+    print("test_regenerate_html_chunk_keeps_original_when_data_src_altered: PASSED")
+
+
+def test_regenerate_html_chunk_accepts_model_appending_new_decorative_image():
+    """A model that keeps all original <img> tags/order and appends a brand-new
+    one at the end must NOT be rejected by the new position-preserved check."""
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = MagicMock(
+        choices=[
+            MagicMock(
+                message=MagicMock(content='<img src="cat.jpg"><img src="new-decorative.jpg">'),
+                finish_reason="stop",
+            )
+        ],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+    html = '<html><head></head><body><img src="cat.jpg"></body></html>'
+
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+
+    assert "new-decorative.jpg" in result
+
+    print("test_regenerate_html_chunk_accepts_model_appending_new_decorative_image: PASSED")
+
+
 def test_none_theme_does_not_leak_into_prompt():
     """
     When RegenerationTheme is None, the system prompt sent to the model must use a
@@ -774,6 +952,28 @@ def test_regenerate_html_reassembles_style_block_with_import_before_other_rules(
     print("test_regenerate_html_reassembles_style_block_with_import_before_other_rules: PASSED")
 
 
+def test_regenerate_html_reassembles_multi_chunk_head():
+    """End-to-end: an oversized <head> splits into multiple 'head' chunks;
+    regenerate_html must concatenate ALL of them (not just chunks[0]) into
+    the final output's <head>, with nothing missing, and without doubling
+    up the <head> wrapper tag."""
+    long_text = "x" * 40000
+    html = f"<html><head><title>{long_text}</title></head><body><div>Hi</div></body></html>"
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = MagicMock(
+        choices=[MagicMock(message=MagicMock(content="<div>regenerated</div>"), finish_reason="stop")],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+
+    assert result.count("x") == 40000, "No head content should be silently dropped"
+    assert "<div>regenerated</div>" in result
+    assert result.count("<head") == 1, "Head chunks must merge into a single, non-nested <head>"
+
+    print("test_regenerate_html_reassembles_multi_chunk_head: PASSED")
+
+
 def test_regenerate_html_raw_fallback_returns_model_output_directly():
     """When head/body can't be parsed, regenerate_html sends the whole document as
     one chunk and returns the model's output as-is, with no <!DOCTYPE> wrapping added."""
@@ -823,6 +1023,38 @@ def test_regenerate_html_raw_fallback_extracts_style_comment_into_style_block():
     assert '<div class="pulse-c0">regenerated fragment</div>' in result
 
     print("test_regenerate_html_raw_fallback_extracts_style_comment_into_style_block: PASSED")
+
+
+def test_hook_class_candidates_excludes_descendant_selector_classes():
+    """A compound/descendant selector like `.card-hover:hover .icon{...}`
+    must only treat `.card-hover` (the leftmost token, where the model's own
+    hook class lives) as a rename candidate. `.icon` is a descendant
+    reference to some other element's existing class and must not be
+    renamed, or unrelated elements sharing that class get corrupted."""
+    style_content = ".card-hover:hover .icon{transform:scale(1.1)}"
+    assert _hook_class_candidates(style_content) == {"card-hover"}
+    print("test_hook_class_candidates_excludes_descendant_selector_classes: PASSED")
+
+
+def test_hook_class_candidates_simple_hover_rule_regression():
+    """Regression: the common case (single-class hover hook) must still work."""
+    assert _hook_class_candidates(".hover-lift:hover{color:gold}") == {"hover-lift"}
+    print("test_hook_class_candidates_simple_hover_rule_regression: PASSED")
+
+
+def test_hook_class_candidates_keyframes_only_untouched():
+    """Regression: a keyframes-only STYLE comment yields no class candidates
+    (keyframe names are handled separately by _KEYFRAMES_NAME_RE)."""
+    assert _hook_class_candidates("@keyframes pulse{0%{opacity:1}100%{opacity:0}}") == set()
+    print("test_hook_class_candidates_keyframes_only_untouched: PASSED")
+
+
+def test_hook_class_candidates_ignores_import_statement():
+    """An @import clause (no braces) must not get swallowed into the next
+    rule's selector header when splitting on '{'."""
+    style_content = "@import url('https://fonts.googleapis.com/css2?family=Orbitron'); .hover-lift:hover{color:gold}"
+    assert _hook_class_candidates(style_content) == {"hover-lift"}
+    print("test_hook_class_candidates_ignores_import_statement: PASSED")
 
 
 def test_regenerate_html_namespaces_colliding_hover_classes_across_chunks():
@@ -917,6 +1149,32 @@ def test_regenerate_html_namespaces_colliding_keyframes_across_chunks():
     print("test_regenerate_html_namespaces_colliding_keyframes_across_chunks: PASSED")
 
 
+def test_regenerate_html_does_not_rename_descendant_class_in_compound_hover_selector():
+    """End-to-end: a model-emitted compound/descendant hover selector must not
+    corrupt an unrelated element in the SAME chunk that legitimately carries
+    the referenced class for a different purpose."""
+    html = "<html><head><title>T</title></head><body><div>seed</div></body></html>"
+    content = (
+        '<div class="card-hover"><span class="icon">x</span></div>'
+        '<div class="icon">unrelated, must stay icon</div>'
+        "<!--STYLE:.card-hover:hover .icon{transform:scale(1.1)}-->"
+    )
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = MagicMock(
+        choices=[MagicMock(message=MagicMock(content=content), finish_reason="stop")],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+
+    assert 'class="card-hover-c1"' in result
+    assert 'class="icon">unrelated, must stay icon' in result
+    style_block = result.split("<style>")[1].split("</style>")[0]
+    assert ".card-hover-c1:hover .icon{transform:scale(1.1)}" in style_block
+
+    print("test_regenerate_html_does_not_rename_descendant_class_in_compound_hover_selector: PASSED")
+
+
 def test_regenerate_html_merges_multiple_raw_chunks():
     """When head/body can't be parsed and the document is large enough to
     split into multiple raw chunks, regenerate_html must concatenate all of
@@ -966,17 +1224,29 @@ if __name__ == "__main__":
     test_split_html_into_chunks_packs_body_children_within_max_chars()
     test_split_node_into_parts_preserves_wrapping_tag_when_splitting()
     test_split_node_into_parts_preserves_script_tag_when_splitting()
+    test_split_node_into_parts_splits_oversized_leaf_without_dropping_content()
+    test_split_html_into_chunks_splits_oversized_head_into_multiple_head_chunks()
     test_split_html_into_chunks_falls_back_to_raw_without_head_or_body()
     test_split_html_into_chunks_splits_large_document_without_head_or_body()
     test_split_html_into_chunks_strips_stale_stylesheet_link_without_head_or_body()
     test_extract_img_srcs_ignores_data_src_attribute()
     test_regenerate_html_chunk_keeps_original_when_model_returns_empty()
     test_regenerate_html_chunk_keeps_original_when_model_drops_image()
+    test_extract_img_data_srcs_matches_only_data_src_attribute()
+    test_regenerate_html_chunk_keeps_original_when_images_are_swapped()
+    test_regenerate_html_chunk_keeps_original_when_data_src_altered()
+    test_regenerate_html_chunk_accepts_model_appending_new_decorative_image()
     test_none_theme_does_not_leak_into_prompt()
     test_regenerate_html_reassembles_style_block_with_import_before_other_rules()
+    test_regenerate_html_reassembles_multi_chunk_head()
     test_regenerate_html_raw_fallback_returns_model_output_directly()
     test_regenerate_html_raw_fallback_extracts_style_comment_into_style_block()
+    test_hook_class_candidates_excludes_descendant_selector_classes()
+    test_hook_class_candidates_simple_hover_rule_regression()
+    test_hook_class_candidates_keyframes_only_untouched()
+    test_hook_class_candidates_ignores_import_statement()
     test_regenerate_html_namespaces_colliding_hover_classes_across_chunks()
     test_regenerate_html_namespaces_colliding_keyframes_across_chunks()
+    test_regenerate_html_does_not_rename_descendant_class_in_compound_hover_selector()
     test_regenerate_html_merges_multiple_raw_chunks()
     print("All tests passed.")

@@ -41,8 +41,11 @@ def split_node_into_parts(node, max_chars: int) -> list[str]:
         if current:
             parts.append(open_tag + "".join(current) + close_tag)
         return parts if parts else [node_str[:max_chars]]
-    print(f"Leaf node too large to split ({len(node_str)} chars), truncating to {max_chars}")
-    return [node_str[:max_chars]]
+    print(
+        f"Leaf node too large to split ({len(node_str)} chars) — splitting into "
+        f"{max_chars}-char pieces so no content is silently dropped"
+    )
+    return [node_str[i : i + max_chars] for i in range(0, len(node_str), max_chars)]
 
 
 def _pack_top_level_children(children, max_chars: int) -> list[str]:
@@ -69,9 +72,10 @@ def _pack_top_level_children(children, max_chars: int) -> list[str]:
 def split_html_into_chunks(html: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> tuple[list[str], list[str]]:
     """Returns (chunks, labels) where labels are 'head'/'body', or 'raw' for
     every chunk when the document can't be parsed into head/body.
-    Chunk 0 is the <head> element when one is found; subsequent chunks are
-    groups of top-level children (of <body>, or of the whole document when
-    there's no head/body) packed to max_chars each."""
+    Leading chunks are the <head> element (one, or more if it exceeds
+    max_chars) when one is found; subsequent chunks are groups of top-level
+    children (of <body>, or of the whole document when there's no
+    head/body) packed to max_chars each."""
     soup = BeautifulSoup(html, "html.parser")
 
     # The old CSS-file pipeline wired in a stylesheet link that no longer
@@ -89,10 +93,9 @@ def split_html_into_chunks(html: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> t
             raw_chunks = [html]
         return raw_chunks, ["raw"] * len(raw_chunks)
 
-    head_str = str(head)
-    if len(head_str) > max_chars:
-        print(f"Head element exceeds {max_chars} chars ({len(head_str)}) — truncating")
-        head_str = head_str[:max_chars]
+    head_chunks = split_node_into_parts(head, max_chars)
+    if len(head_chunks) > 1:
+        print(f"Head element exceeds {max_chars} chars — split into {len(head_chunks)} head chunks")
 
     body_chunks = _pack_top_level_children(body.children, max_chars)
-    return [head_str] + body_chunks, ["head"] + ["body"] * len(body_chunks)
+    return head_chunks + body_chunks, ["head"] * len(head_chunks) + ["body"] * len(body_chunks)

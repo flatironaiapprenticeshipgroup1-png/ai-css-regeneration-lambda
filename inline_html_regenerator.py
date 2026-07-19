@@ -16,16 +16,78 @@ _STYLE_COMMENT_RE = re.compile(r"<!--STYLE:(.*?)-->", re.DOTALL)
 # '-'->'s' transition is a word boundary), which would validate the img-src
 # safety check below against the wrong attribute on lazy-loaded images.
 _IMG_SRC_RE = re.compile(r'<img\b[^>]*(?<![\w-])src=["\']([^"\']+)["\']', re.IGNORECASE)
+# Lazy-loaded images often carry their real URL in data-src (with src holding
+# a placeholder) — protected separately from src by _extract_img_data_srcs.
+_IMG_DATA_SRC_RE = re.compile(r'<img\b[^>]*(?<![\w-])data-src=["\']([^"\']+)["\']', re.IGNORECASE)
 # Identifiers the model may introduce inside a <!--STYLE:...--> comment for a
 # hover/animation hook — used to namespace them per chunk (see
 # _namespace_chunk_style_identifiers) so two independently-regenerated chunks
 # can never collide on the same class/keyframe name.
 _STYLE_CLASS_SELECTOR_RE = re.compile(r"\.([A-Za-z_][A-Za-z0-9_-]*)")
 _KEYFRAMES_NAME_RE = re.compile(r"@keyframes\s+([A-Za-z_][A-Za-z0-9_-]*)")
+_IMPORT_STATEMENT_RE = re.compile(r"@import[^;]*;", re.IGNORECASE)
+_RULE_HEADER_RE = re.compile(r"([^{}]+)\{")
+_SELECTOR_COMBINATOR_SPLIT_RE = re.compile(r"[\s>+~]+")
+# Each head chunk from split_node_into_parts already carries its own
+# <head>...</head> wrapper (str(head) includes the tag itself); stripped so
+# regenerate_html's own <head>{...}</head> wrapping doesn't nest.
+_HEAD_OPEN_TAG_RE = re.compile(r"^<head\b[^>]*>", re.IGNORECASE)
+_HEAD_CLOSE_TAG_RE = re.compile(r"</head>$", re.IGNORECASE)
+
+
+def _strip_head_wrapper(head_chunk: str) -> str:
+    return _HEAD_CLOSE_TAG_RE.sub("", _HEAD_OPEN_TAG_RE.sub("", head_chunk, count=1))
+
+
+def _extract_ordered_img_srcs(html: str) -> list[str]:
+    """Left-to-right ordered list of <img> src values (may contain
+    duplicates) — used both for the drop/alter check (via set()) and for the
+    position-preserved check below, which a plain set comparison can't do."""
+    return _IMG_SRC_RE.findall(html)
 
 
 def _extract_img_srcs(html: str) -> set[str]:
-    return set(_IMG_SRC_RE.findall(html))
+    return set(_extract_ordered_img_srcs(html))
+
+
+def _extract_img_data_srcs(html: str) -> set[str]:
+    return set(_IMG_DATA_SRC_RE.findall(html))
+
+
+def _img_order_preserved(original_ordered: list[str], new_ordered: list[str]) -> bool:
+    """True if every original <img> src still appears, unchanged, at the same
+    left-to-right position as a PREFIX of the regenerated output's <img>
+    srcs. Catches a same-URL-set swap between two images (e.g. cat.jpg and
+    dog.jpg trading places) that a set-based subset check can't see, since
+    chunks are already-parsed HTML fragments regenerated in isolation —
+    element reordering isn't an expected/legitimate transformation here.
+    Tolerates the model appending brand-new <img> tags after all originals;
+    (conservatively) rejects a new image inserted mid-sequence, which shifts
+    every later original out of its prefix position — a deliberate,
+    low-cost false-positive trade (falls back to the original chunk, never
+    corrupts) in exchange for closing the swap-detection hole."""
+    return new_ordered[: len(original_ordered)] == original_ordered
+
+
+def _hook_class_candidates(style_content: str) -> set[str]:
+    """Returns class names that are the model's own invented hook class(es) —
+    i.e. appear in the leftmost compound-selector token of some rule — as
+    opposed to a class referenced only in a later, descendant-combinator
+    token (e.g. the .icon in ".card-hover:hover .icon{...}"), which points at
+    an existing/reused class on a *different* element and must not be
+    renamed. If the leftmost token is itself a chained compound selector with
+    no combinator (e.g. ".card.hover-lift:hover"), both classes are treated
+    as candidates — the system prompt only allows the model one hook class
+    per rule, so a compliant model shouldn't produce this shape."""
+    content = _IMPORT_STATEMENT_RE.sub("", style_content)
+    candidates: set[str] = set()
+    for header_match in _RULE_HEADER_RE.finditer(content):
+        for selector in header_match.group(1).split(","):
+            selector = selector.strip()
+            if selector:
+                first_token = _SELECTOR_COMBINATOR_SPLIT_RE.split(selector, maxsplit=1)[0]
+                candidates.update(_STYLE_CLASS_SELECTOR_RE.findall(first_token))
+    return candidates
 
 
 def _namespace_chunk_style_identifiers(regenerated_html: str, chunk_index: int) -> str:
@@ -40,9 +102,7 @@ def _namespace_chunk_style_identifiers(regenerated_html: str, chunk_index: int) 
         return regenerated_html
 
     style_content = match.group(1)
-    identifiers = set(_STYLE_CLASS_SELECTOR_RE.findall(style_content)) | set(
-        _KEYFRAMES_NAME_RE.findall(style_content)
-    )
+    identifiers = _hook_class_candidates(style_content) | set(_KEYFRAMES_NAME_RE.findall(style_content))
     if not identifiers:
         return regenerated_html
 
@@ -148,11 +208,23 @@ def _regenerate_chunk(
         )
         return chunk
 
-    original_img_srcs = _extract_img_srcs(chunk)
-    if original_img_srcs and not original_img_srcs.issubset(_extract_img_srcs(regenerated_html)):
+    original_ordered_srcs = _extract_ordered_img_srcs(chunk)
+    new_ordered_srcs = _extract_ordered_img_srcs(regenerated_html)
+    original_img_srcs = set(original_ordered_srcs)
+    original_data_srcs = _extract_img_data_srcs(chunk)
+
+    img_src_broken = original_img_srcs and (
+        not original_img_srcs.issubset(set(new_ordered_srcs))
+        or not _img_order_preserved(original_ordered_srcs, new_ordered_srcs)
+    )
+    img_data_src_broken = original_data_srcs and not original_data_srcs.issubset(
+        _extract_img_data_srcs(regenerated_html)
+    )
+
+    if img_src_broken or img_data_src_broken:
         print(
-            f"Chunk {chunk_index + 1}/{total_chunks}: model dropped or altered an <img> src; "
-            f"keeping original chunk unchanged so images don't break"
+            f"Chunk {chunk_index + 1}/{total_chunks}: model dropped, reordered, or altered an "
+            f"<img> src/data-src; keeping original chunk unchanged so images don't break"
         )
         return chunk
 
@@ -175,10 +247,12 @@ def regenerate_html(
 
     # The head needs no AI regeneration — it carries no visual styling to re-theme.
     # Chunks labeled "body" (or "raw", when head/body couldn't be parsed) go to the model.
+    # There can be more than one leading "head" chunk if the head exceeds max_chars.
+    head_chunk_count = labels.count("head")
     regen_indices = [i for i, label in enumerate(labels) if label != "head"]
     results = {}
-    if labels[0] == "head":
-        results[0] = chunks[0]
+    for i in range(head_chunk_count):
+        results[i] = chunks[i]
 
     with ThreadPoolExecutor(max_workers=min(len(regen_indices), MAX_CONCURRENT_CHUNK_REQUESTS) or 1) as executor:
         futures = {
@@ -205,8 +279,8 @@ def regenerate_html(
             return f"{_build_style_block(style_rules)}\n{cleaned_html}"
         return cleaned_html
 
-    head_content = results[0]
-    body_parts = [results[i] for i in range(1, len(chunks))]
+    head_content = "".join(_strip_head_wrapper(results[i]) for i in range(head_chunk_count))
+    body_parts = [results[i] for i in range(head_chunk_count, len(chunks))]
 
     style_rules = []
     cleaned_body_parts = []
