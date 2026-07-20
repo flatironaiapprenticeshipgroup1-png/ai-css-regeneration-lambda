@@ -74,9 +74,11 @@ from bs4 import BeautifulSoup
 
 from html_chunker import split_html_into_chunks, split_node_into_parts
 from inline_html_regenerator import (
+    _DEFAULT_STYLE_GUIDE,
     _extract_img_data_srcs,
     _extract_img_srcs,
     _hook_class_candidates,
+    generate_style_guide,
     regenerate_html,
 )
 
@@ -201,6 +203,7 @@ def _clear_modules():
 # <body> child. split_html_into_chunks returns [head, body-div], and the head chunk
 # doesn't go through the model, so there's exactly one "regenerating_html_and_styling_chunks_completed" event.
 EXPECTED_STEPS = [
+    "generating_style_guide",
     "chunking",
     "regenerating_html_and_styling",
     "regenerating_html_and_styling_chunks_completed",
@@ -860,7 +863,7 @@ def test_regenerate_html_chunk_accepts_model_appending_new_decorative_image():
     )
     html = '<html><head></head><body><img src="cat.jpg"></body></html>'
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
 
     assert "new-decorative.jpg" in result
 
@@ -937,7 +940,7 @@ def test_regenerate_html_reassembles_style_block_with_import_before_other_rules(
     mock_client = MagicMock()
     mock_client.chat.completions.create.side_effect = side_effect
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
 
     assert result.count("<style>") == 1
     style_block = result.split("<style>")[1].split("</style>")[0]
@@ -965,7 +968,7 @@ def test_regenerate_html_reassembles_multi_chunk_head():
         usage=MagicMock(prompt_tokens=100, completion_tokens=200),
     )
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
 
     assert result.count("x") == 40000, "No head content should be silently dropped"
     assert "<div>regenerated</div>" in result
@@ -984,7 +987,7 @@ def test_regenerate_html_raw_fallback_returns_model_output_directly():
         usage=MagicMock(prompt_tokens=100, completion_tokens=200),
     )
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
 
     assert result == "<div>regenerated fragment</div>"
     assert "<!DOCTYPE" not in result
@@ -1012,7 +1015,7 @@ def test_regenerate_html_raw_fallback_extracts_style_comment_into_style_block():
         usage=MagicMock(prompt_tokens=100, completion_tokens=200),
     )
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
 
     assert "<!--STYLE:" not in result, "STYLE comment should be stripped from the output"
     assert "<style>" in result and "</style>" in result
@@ -1093,7 +1096,7 @@ def test_regenerate_html_namespaces_colliding_hover_classes_across_chunks():
     mock_client = MagicMock()
     mock_client.chat.completions.create.side_effect = side_effect
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
 
     style_block = result.split("<style>")[1].split("</style>")[0]
     assert style_block.count(":hover{") == 2, "Both chunks' hover rules must survive, not collapse into one"
@@ -1138,7 +1141,7 @@ def test_regenerate_html_namespaces_colliding_keyframes_across_chunks():
     mock_client = MagicMock()
     mock_client.chat.completions.create.side_effect = side_effect
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
 
     style_block = result.split("<style>")[1].split("</style>")[0]
     assert "@keyframes fade-in-c1{0%{opacity:0}100%{opacity:1}}" in style_block
@@ -1165,7 +1168,7 @@ def test_regenerate_html_does_not_rename_descendant_class_in_compound_hover_sele
         usage=MagicMock(prompt_tokens=100, completion_tokens=200),
     )
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
 
     assert 'class="card-hover-c1"' in result
     assert 'class="icon">unrelated, must stay icon' in result
@@ -1201,7 +1204,7 @@ def test_regenerate_html_merges_multiple_raw_chunks():
     mock_client = MagicMock()
     mock_client.chat.completions.create.side_effect = side_effect
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
 
     assert "A regenerated" in result and "B regenerated" in result
     assert "<!--STYLE:" not in result
@@ -1210,6 +1213,58 @@ def test_regenerate_html_merges_multiple_raw_chunks():
     assert "@keyframes fade-c0" in style_block
 
     print("test_regenerate_html_merges_multiple_raw_chunks: PASSED")
+
+
+def test_generate_style_guide_falls_back_to_default_on_empty_response():
+    """If the model returns empty content, generate_style_guide must fall back
+    to the hardcoded default guide rather than passing an empty string through
+    to every chunk (which would silently drop all shared-consistency guidance)."""
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = MagicMock(
+        choices=[MagicMock(message=MagicMock(content=""), finish_reason="stop")],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+
+    result = generate_style_guide(mock_client, "theme prompt", "retro arcade")
+
+    assert result == _DEFAULT_STYLE_GUIDE
+    print("test_generate_style_guide_falls_back_to_default_on_empty_response: PASSED")
+
+
+def test_generate_style_guide_falls_back_to_default_on_api_error():
+    """If the OpenAI call itself raises, generate_style_guide must not propagate
+    the exception — a transient failure on this one extra call shouldn't fail
+    the whole regeneration job when a safe default guide is available."""
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = Exception("boom")
+
+    result = generate_style_guide(mock_client, "theme prompt", "retro arcade")
+
+    assert result == _DEFAULT_STYLE_GUIDE
+    print("test_generate_style_guide_falls_back_to_default_on_api_error: PASSED")
+
+
+def test_regenerate_chunk_prompt_includes_style_guide_and_layout_preservation():
+    """Every chunk's system prompt must include the shared style guide text
+    verbatim (so independently-regenerated chunks stay visually consistent)
+    and the layout-preservation rules (so flex/grid/positioning survive the
+    theme rewrite)."""
+    html = '<html><head></head><body><div style="display:flex">Hi</div></body></html>'
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = MagicMock(
+        choices=[MagicMock(message=MagicMock(content='<div style="display:flex">Hi</div>'), finish_reason="stop")],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+
+    regenerate_html(mock_client, html, "theme prompt", "retro arcade", "MY UNIQUE STYLE GUIDE TEXT")
+
+    system_msg = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert "MY UNIQUE STYLE GUIDE TEXT" in system_msg
+    assert "LAYOUT & POSITIONING" in system_msg
+    assert "grid-template-columns" in system_msg
+    assert "flex-direction" in system_msg
+
+    print("test_regenerate_chunk_prompt_includes_style_guide_and_layout_preservation: PASSED")
 
 
 if __name__ == "__main__":
@@ -1249,4 +1304,7 @@ if __name__ == "__main__":
     test_regenerate_html_namespaces_colliding_keyframes_across_chunks()
     test_regenerate_html_does_not_rename_descendant_class_in_compound_hover_selector()
     test_regenerate_html_merges_multiple_raw_chunks()
+    test_generate_style_guide_falls_back_to_default_on_empty_response()
+    test_generate_style_guide_falls_back_to_default_on_api_error()
+    test_regenerate_chunk_prompt_includes_style_guide_and_layout_preservation()
     print("All tests passed.")
