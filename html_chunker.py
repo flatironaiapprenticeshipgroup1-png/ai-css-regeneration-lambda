@@ -23,6 +23,13 @@ def split_node_into_parts(node, max_chars: int) -> list[str]:
     if len(node_str) <= max_chars:
         return [node_str]
     if isinstance(node, Tag) and node.name:
+        # node_str is only needed for the length check above and the empty-parts
+        # fallback below; keep just the (small, max_chars-bounded) truncated copy
+        # and drop the full string before recursing, so this oversized subtree's
+        # full serialization doesn't linger in memory for the entire recursive
+        # descent into its children.
+        truncated_fallback = node_str[:max_chars]
+        del node_str
         open_tag, close_tag = _tag_open_close(node)
         child_budget = max(max_chars - len(open_tag) - len(close_tag), 1)
 
@@ -40,7 +47,7 @@ def split_node_into_parts(node, max_chars: int) -> list[str]:
                     current_size += len(part)
         if current:
             parts.append(open_tag + "".join(current) + close_tag)
-        return parts if parts else [node_str[:max_chars]]
+        return parts if parts else [truncated_fallback]
     print(
         f"Leaf node too large to split ({len(node_str)} chars) — splitting into "
         f"{max_chars}-char pieces so no content is silently dropped"

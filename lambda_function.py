@@ -96,6 +96,7 @@ def lambda_handler(event, context):
             publish(step="chunking", status="ai_lambda_processing", message="Compressing HTML into chunks for processing")
             publish(step="regenerating_html_and_styling", status="ai_lambda_processing", message="Ai Regenerating HTML and styling for the website")
             regenerated_html = regenerate_html(client, content, theme_prompt, regeneration_theme, on_chunk_complete)
+            del content  # drop the original full-document string before the encode/upload below
             print(f"Regenerated HTML total size: {len(regenerated_html)} characters")
 
             s3.put_object(
