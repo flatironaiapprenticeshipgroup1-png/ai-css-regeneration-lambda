@@ -74,11 +74,9 @@ from bs4 import BeautifulSoup
 
 from html_chunker import split_html_into_chunks, split_node_into_parts
 from inline_html_regenerator import (
-    _DEFAULT_STYLE_GUIDE,
     _extract_img_data_srcs,
     _extract_img_srcs,
     _hook_class_candidates,
-    generate_style_guide,
     regenerate_html,
 )
 
@@ -203,7 +201,6 @@ def _clear_modules():
 # <body> child. split_html_into_chunks returns [head, body-div], and the head chunk
 # doesn't go through the model, so there's exactly one "regenerating_html_and_styling_chunks_completed" event.
 EXPECTED_STEPS = [
-    "generating_style_guide",
     "chunking",
     "regenerating_html_and_styling",
     "regenerating_html_and_styling_chunks_completed",
@@ -863,7 +860,7 @@ def test_regenerate_html_chunk_accepts_model_appending_new_decorative_image():
     )
     html = '<html><head></head><body><img src="cat.jpg"></body></html>'
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
 
     assert "new-decorative.jpg" in result
 
@@ -940,7 +937,7 @@ def test_regenerate_html_reassembles_style_block_with_import_before_other_rules(
     mock_client = MagicMock()
     mock_client.chat.completions.create.side_effect = side_effect
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
 
     assert result.count("<style>") == 1
     style_block = result.split("<style>")[1].split("</style>")[0]
@@ -968,13 +965,82 @@ def test_regenerate_html_reassembles_multi_chunk_head():
         usage=MagicMock(prompt_tokens=100, completion_tokens=200),
     )
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
 
     assert result.count("x") == 40000, "No head content should be silently dropped"
-    assert "<div>regenerated</div>" in result
+    assert ">regenerated</div>" in result
+    assert 'style="width:100%;height:100%"' in result, (
+        "Single top-level body div should be forced to fill the page"
+    )
     assert result.count("<head") == 1, "Head chunks must merge into a single, non-nested <head>"
 
     print("test_regenerate_html_reassembles_multi_chunk_head: PASSED")
+
+
+def test_regenerate_html_forces_full_width_height_on_single_root_wrapper():
+    """When the regenerated body has exactly one top-level element (the common
+    'single wrapper div holds the whole page' shape), it must be forced to
+    width:100%/height:100% so the page fills the iframe it's displayed in,
+    with any pre-existing conflicting width/height replaced rather than
+    duplicated alongside the forced values."""
+    html = '<html><head></head><body><div style="width:300px;height:200px;color:red">Hi</div></body></html>'
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = MagicMock(
+        choices=[
+            MagicMock(
+                message=MagicMock(content='<div style="width:300px;height:200px;color:neon">Hi</div>'),
+                finish_reason="stop",
+            )
+        ],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+
+    style_attr = re.search(r'<div style="([^"]*)">Hi</div>', result).group(1)
+    assert "width:100%" in style_attr
+    assert "height:100%" in style_attr
+    assert "width:300px" not in style_attr
+    assert "height:200px" not in style_attr
+    assert "color:neon" in style_attr, "Unrelated declarations must survive the merge"
+    assert style_attr.count("width:") == 1 and style_attr.count("height:") == 1
+
+    print("test_regenerate_html_forces_full_width_height_on_single_root_wrapper: PASSED")
+
+
+def test_regenerate_html_does_not_force_full_width_with_multiple_top_level_siblings():
+    """When the regenerated body has more than one top-level element (e.g.
+    header/main/footer siblings), there's no single 'main div' to target, so
+    neither sibling should be forced to width:100%/height:100%."""
+    big_a = "a" * 20000
+    big_b = "b" * 20000
+    html = (
+        "<html><head><title>T</title></head><body>"
+        f'<div class="chunk-a">{big_a}</div>'
+        f'<div class="chunk-b">{big_b}</div>'
+        "</body></html>"
+    )
+
+    def side_effect(**kwargs):
+        user_content = kwargs["messages"][1]["content"]
+        if "chunk-a" in user_content:
+            content = '<div class="chunk-a" style="color:red">A</div>'
+        else:
+            content = '<div class="chunk-b" style="color:blue">B</div>'
+        return MagicMock(
+            choices=[MagicMock(message=MagicMock(content=content), finish_reason="stop")],
+            usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+        )
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = side_effect
+
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
+
+    assert "width:100%" not in result
+    assert "height:100%" not in result
+
+    print("test_regenerate_html_does_not_force_full_width_with_multiple_top_level_siblings: PASSED")
 
 
 def test_regenerate_html_raw_fallback_returns_model_output_directly():
@@ -987,7 +1053,7 @@ def test_regenerate_html_raw_fallback_returns_model_output_directly():
         usage=MagicMock(prompt_tokens=100, completion_tokens=200),
     )
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
 
     assert result == "<div>regenerated fragment</div>"
     assert "<!DOCTYPE" not in result
@@ -1015,7 +1081,7 @@ def test_regenerate_html_raw_fallback_extracts_style_comment_into_style_block():
         usage=MagicMock(prompt_tokens=100, completion_tokens=200),
     )
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
 
     assert "<!--STYLE:" not in result, "STYLE comment should be stripped from the output"
     assert "<style>" in result and "</style>" in result
@@ -1096,7 +1162,7 @@ def test_regenerate_html_namespaces_colliding_hover_classes_across_chunks():
     mock_client = MagicMock()
     mock_client.chat.completions.create.side_effect = side_effect
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
 
     style_block = result.split("<style>")[1].split("</style>")[0]
     assert style_block.count(":hover{") == 2, "Both chunks' hover rules must survive, not collapse into one"
@@ -1141,7 +1207,7 @@ def test_regenerate_html_namespaces_colliding_keyframes_across_chunks():
     mock_client = MagicMock()
     mock_client.chat.completions.create.side_effect = side_effect
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
 
     style_block = result.split("<style>")[1].split("</style>")[0]
     assert "@keyframes fade-in-c1{0%{opacity:0}100%{opacity:1}}" in style_block
@@ -1168,7 +1234,7 @@ def test_regenerate_html_does_not_rename_descendant_class_in_compound_hover_sele
         usage=MagicMock(prompt_tokens=100, completion_tokens=200),
     )
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
 
     assert 'class="card-hover-c1"' in result
     assert 'class="icon">unrelated, must stay icon' in result
@@ -1204,7 +1270,7 @@ def test_regenerate_html_merges_multiple_raw_chunks():
     mock_client = MagicMock()
     mock_client.chat.completions.create.side_effect = side_effect
 
-    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade", "style guide")
+    result = regenerate_html(mock_client, html, "theme prompt", "retro arcade")
 
     assert "A regenerated" in result and "B regenerated" in result
     assert "<!--STYLE:" not in result
@@ -1215,40 +1281,9 @@ def test_regenerate_html_merges_multiple_raw_chunks():
     print("test_regenerate_html_merges_multiple_raw_chunks: PASSED")
 
 
-def test_generate_style_guide_falls_back_to_default_on_empty_response():
-    """If the model returns empty content, generate_style_guide must fall back
-    to the hardcoded default guide rather than passing an empty string through
-    to every chunk (which would silently drop all shared-consistency guidance)."""
-    mock_client = MagicMock()
-    mock_client.chat.completions.create.return_value = MagicMock(
-        choices=[MagicMock(message=MagicMock(content=""), finish_reason="stop")],
-        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
-    )
-
-    result = generate_style_guide(mock_client, "theme prompt", "retro arcade")
-
-    assert result == _DEFAULT_STYLE_GUIDE
-    print("test_generate_style_guide_falls_back_to_default_on_empty_response: PASSED")
-
-
-def test_generate_style_guide_falls_back_to_default_on_api_error():
-    """If the OpenAI call itself raises, generate_style_guide must not propagate
-    the exception — a transient failure on this one extra call shouldn't fail
-    the whole regeneration job when a safe default guide is available."""
-    mock_client = MagicMock()
-    mock_client.chat.completions.create.side_effect = Exception("boom")
-
-    result = generate_style_guide(mock_client, "theme prompt", "retro arcade")
-
-    assert result == _DEFAULT_STYLE_GUIDE
-    print("test_generate_style_guide_falls_back_to_default_on_api_error: PASSED")
-
-
-def test_regenerate_chunk_prompt_includes_style_guide_and_layout_preservation():
-    """Every chunk's system prompt must include the shared style guide text
-    verbatim (so independently-regenerated chunks stay visually consistent)
-    and the layout-preservation rules (so flex/grid/positioning survive the
-    theme rewrite)."""
+def test_regenerate_chunk_prompt_includes_layout_preservation():
+    """Every chunk's system prompt must include the layout-preservation rules
+    (so flex/grid/positioning survive the theme rewrite)."""
     html = '<html><head></head><body><div style="display:flex">Hi</div></body></html>'
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = MagicMock(
@@ -1256,15 +1291,14 @@ def test_regenerate_chunk_prompt_includes_style_guide_and_layout_preservation():
         usage=MagicMock(prompt_tokens=100, completion_tokens=200),
     )
 
-    regenerate_html(mock_client, html, "theme prompt", "retro arcade", "MY UNIQUE STYLE GUIDE TEXT")
+    regenerate_html(mock_client, html, "theme prompt", "retro arcade")
 
     system_msg = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
-    assert "MY UNIQUE STYLE GUIDE TEXT" in system_msg
     assert "LAYOUT & POSITIONING" in system_msg
     assert "grid-template-columns" in system_msg
     assert "flex-direction" in system_msg
 
-    print("test_regenerate_chunk_prompt_includes_style_guide_and_layout_preservation: PASSED")
+    print("test_regenerate_chunk_prompt_includes_layout_preservation: PASSED")
 
 
 if __name__ == "__main__":
@@ -1294,6 +1328,8 @@ if __name__ == "__main__":
     test_none_theme_does_not_leak_into_prompt()
     test_regenerate_html_reassembles_style_block_with_import_before_other_rules()
     test_regenerate_html_reassembles_multi_chunk_head()
+    test_regenerate_html_forces_full_width_height_on_single_root_wrapper()
+    test_regenerate_html_does_not_force_full_width_with_multiple_top_level_siblings()
     test_regenerate_html_raw_fallback_returns_model_output_directly()
     test_regenerate_html_raw_fallback_extracts_style_comment_into_style_block()
     test_hook_class_candidates_excludes_descendant_selector_classes()
@@ -1304,7 +1340,5 @@ if __name__ == "__main__":
     test_regenerate_html_namespaces_colliding_keyframes_across_chunks()
     test_regenerate_html_does_not_rename_descendant_class_in_compound_hover_selector()
     test_regenerate_html_merges_multiple_raw_chunks()
-    test_generate_style_guide_falls_back_to_default_on_empty_response()
-    test_generate_style_guide_falls_back_to_default_on_api_error()
-    test_regenerate_chunk_prompt_includes_style_guide_and_layout_preservation()
+    test_regenerate_chunk_prompt_includes_layout_preservation()
     print("All tests passed.")

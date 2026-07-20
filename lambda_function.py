@@ -6,7 +6,7 @@ from status_publisher import get_current_sequence, publish_status_update
 import boto3
 from openai import OpenAI
 
-from inline_html_regenerator import generate_style_guide, regenerate_html
+from inline_html_regenerator import regenerate_html
 
 s3 = boto3.client("s3")
 secrets_client = boto3.client("secretsmanager")
@@ -93,14 +93,9 @@ def lambda_handler(event, context):
                     f"Regenerate the page using the theme: {regeneration_theme}."
                 )
 
-            publish(step="generating_style_guide", status="ai_lambda_processing", message="Generating shared style guide for the website")
-            style_guide = generate_style_guide(client, theme_prompt, regeneration_theme)
-
             publish(step="chunking", status="ai_lambda_processing", message="Compressing HTML into chunks for processing")
             publish(step="regenerating_html_and_styling", status="ai_lambda_processing", message="Ai Regenerating HTML and styling for the website")
-            regenerated_html = regenerate_html(
-                client, content, theme_prompt, regeneration_theme, style_guide, on_chunk_complete
-            )
+            regenerated_html = regenerate_html(client, content, theme_prompt, regeneration_theme, on_chunk_complete)
             del content  # drop the original full-document string before the encode/upload below
             print(f"Regenerated HTML total size: {len(regenerated_html)} characters")
 

@@ -2,6 +2,7 @@ import re
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from bs4 import BeautifulSoup, Tag
 from openai import OpenAI
 
 from html_chunker import split_html_into_chunks
@@ -122,78 +123,31 @@ def _build_style_block(style_rules: list[str]) -> str:
     return f"<style>\n{joined_rules}\n</style>"
 
 
-_DEFAULT_STYLE_GUIDE = """COLOR PALETTE:
-1. Primary: #2563EB - main brand color, primary buttons and links
-2. Secondary: #1E293B - headings and dark surfaces
-3. Accent: #F59E0B - highlights, calls to action
-4. Background: #F8FAFC - page and section backgrounds
-5. Text: #0F172A - body text
+def _force_full_width_on_single_root_wrapper(body_html: str) -> str:
+    """If the regenerated page has exactly one top-level element directly
+    under <body> (a single wrapper div holding the whole page — the common
+    case for templated/exported sites), force it to width:100%/height:100%
+    so the page fills the iframe it's displayed in rather than leaving a
+    gap. Left alone if the page has multiple top-level siblings (e.g.
+    header/main/footer), since there's no single "main div" to target.
+    This is a deterministic, code-enforced guarantee rather than something
+    left to the model to get right on its own, mirroring how <img> src
+    integrity is guaranteed in _regenerate_chunk above."""
+    soup = BeautifulSoup(body_html, "html.parser")
+    top_level_tags = [node for node in soup.contents if isinstance(node, Tag)]
+    if len(top_level_tags) != 1:
+        return body_html
 
-TYPOGRAPHY:
-Headings: 'Inter', sans-serif. Body: 'Inter', sans-serif.
+    wrapper = top_level_tags[0]
+    declarations = [d.strip() for d in wrapper.get("style", "").split(";") if d.strip()]
+    declarations = [
+        d for d in declarations if d.split(":", 1)[0].strip().lower() not in ("width", "height")
+    ]
+    declarations.append("width:100%")
+    declarations.append("height:100%")
+    wrapper["style"] = ";".join(declarations)
 
-BORDERS & SHAPES:
-Rounded corners (border-radius: 8px-12px), subtle 1px borders.
-
-SPACING:
-Comfortable, moderately generous spacing.
-
-EFFECTS:
-Soft, low-opacity box-shadows; no gradients."""
-
-
-def generate_style_guide(client: OpenAI, theme_prompt: str, regeneration_theme: str | None) -> str:
-    """Generates one shared design style guide for the whole website, called
-    once per regeneration job (not per chunk). Threading this same guide into
-    every chunk's prompt (see _regenerate_chunk) is what keeps independently-
-    regenerated chunks visually consistent with each other, instead of each
-    chunk improvising its own color palette/fonts as before."""
-    theme_label = regeneration_theme or "a clean modern redesign"
-    system_msg = (
-        "You are a web design expert. Produce a concise design style guide for a website "
-        "theme, to be handed to several independent designers who must each style a different "
-        "section of the same page — the guide is the only thing keeping their work consistent, "
-        "so it must be specific and unambiguous. Return PLAIN TEXT only (no markdown, no code "
-        "fences), following exactly this structure and nothing else:\n\n"
-        "COLOR PALETTE:\n"
-        "1. Primary: #RRGGBB - <role/usage>\n"
-        "2. Secondary: #RRGGBB - <role/usage>\n"
-        "3. Accent: #RRGGBB - <role/usage>\n"
-        "4. Background: #RRGGBB - <role/usage>\n"
-        "5. Text: #RRGGBB - <role/usage>\n\n"
-        "TYPOGRAPHY:\n"
-        "<heading font family, body font family; name a Google Font if a distinctive look fits "
-        "the theme>\n\n"
-        "BORDERS & SHAPES:\n"
-        "<corner radius and border style direction>\n\n"
-        "SPACING:\n"
-        "<density direction: compact vs. generous>\n\n"
-        "EFFECTS:\n"
-        "<shadow/gradient direction>\n\n"
-        "Provide EXACTLY 5 colors, no more, no fewer. Every hex code must be a complete, valid "
-        "6-digit hex color."
-    )
-    user_msg = f"{theme_prompt}\n\nGenerate the style guide for this theme: {theme_label}."
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            max_tokens=600,
-        )
-        style_guide = response.choices[0].message.content
-    except Exception as e:
-        print(f"Style guide generation failed ({e}); falling back to default style guide")
-        return _DEFAULT_STYLE_GUIDE
-
-    if not style_guide or not style_guide.strip():
-        print("Style guide generation returned empty output; falling back to default style guide")
-        return _DEFAULT_STYLE_GUIDE
-
-    return style_guide.strip()
+    return "".join(str(node) for node in soup.contents)
 
 
 def _regenerate_chunk(
@@ -201,7 +155,6 @@ def _regenerate_chunk(
     chunk: str,
     theme_prompt: str,
     regeneration_theme: str | None,
-    style_guide: str,
     chunk_index: int,
     total_chunks: int,
 ) -> str:
@@ -214,34 +167,31 @@ def _regenerate_chunk(
             ORIGINAL site's look. Rewrite every element's style="..." attribute so its styling matches this theme:
             {theme_label}. Replace the existing values — do not layer new declarations on top of the old ones.
 
-            STYLE GUIDE — every chunk of this page is being regenerated independently by a different
-            call like this one, so this shared guide is the only thing keeping them visually consistent.
-            Conform to it exactly rather than inventing your own colors/fonts/style direction:
-            {style_guide}
-
             You should try to change the following if a change fits the theme— not just colors:
 
             TYPOGRAPHY:
-            Set font-family in each element's inline style to the fonts specified in the STYLE GUIDE above,
+            Set font-family in each element's inline style to theme-appropriate fonts,
             Change font-size, font-weight, letter-spacing, and line-height inline to match the theme,
-            If the STYLE GUIDE names a distinctive font that isn't a standard system font (e.g. a Google Font),
-            it must be loaded or it will silently fall back to the browser default — include an
+            If you use a distinctive font that isn't a standard system font (e.g. a Google Font), it must be loaded
+            or it will silently fall back to the browser default — include an
             @import url('https://fonts.googleapis.com/...'); as the content of a trailing HTML comment of the exact
             form <!--STYLE:@import url('...');--> (the same comment convention used for hover/keyframe rules below),
 
             COLORS:
             Replace every background-color, color, and border-color in each style attribute,
-            Use ONLY the 5 colors given in the STYLE GUIDE's COLOR PALETTE above — do not invent or introduce
-            any other colors, and apply each of the 5 colors according to the role the STYLE GUIDE assigns it,
+            Build a cohesive color palette — do not just swap one color for another,
+            Apply the palette consistently across all elements,
 
             BORDERS & SHAPES:
-            Change border and border-radius values inline to match the STYLE GUIDE's BORDERS & SHAPES direction,
+            Change border and border-radius values inline,
+            A futuristic theme might use sharp corners; organic themes use rounded ones,
 
             SPACING & LAYOUT:
-            Change padding and margin values inline to reflect the STYLE GUIDE's SPACING direction,
+            Change padding and margin values inline to reflect the theme's density,
+            Compact themes feel tight; luxurious themes use generous whitespace,
 
             DECORATIVE EFFECTS:
-            Add or rewrite box-shadow, text-shadow, and background-image gradients inline to match the STYLE GUIDE's EFFECTS direction,
+            Add or rewrite box-shadow, text-shadow, and background-image gradients inline,
 
             HOVER EFFECTS & ANIMATIONS:
             Inline style="..." attributes cannot express :hover or @keyframes. Where a hover effect or animation
@@ -325,15 +275,12 @@ def regenerate_html(
     html: str,
     theme_prompt: str,
     regeneration_theme: str | None,
-    style_guide: str,
     on_chunk_complete: Callable[[int, int], None] | None = None,
 ) -> str:
     """Regenerates HTML with inline per-element styling using GPT-4o, processing
-    chunks in parallel. style_guide (see generate_style_guide) is passed identically
-    to every chunk so independently-regenerated chunks stay visually consistent.
-    on_chunk_complete(chunk_index, total_chunks) is called (thread-safely by the
-    caller's responsibility) after each chunk finishes — use it to publish
-    per-chunk status updates."""
+    chunks in parallel. on_chunk_complete(chunk_index, total_chunks) is called
+    (thread-safely by the caller's responsibility) after each chunk finishes —
+    use it to publish per-chunk status updates."""
     chunks, labels = split_html_into_chunks(html)
     print(f"Split HTML into {len(chunks)} chunk(s) for processing")
 
@@ -348,9 +295,7 @@ def regenerate_html(
 
     with ThreadPoolExecutor(max_workers=min(len(regen_indices), MAX_CONCURRENT_CHUNK_REQUESTS) or 1) as executor:
         futures = {
-            executor.submit(
-                _regenerate_chunk, client, chunks[i], theme_prompt, regeneration_theme, style_guide, i, len(chunks)
-            ): i
+            executor.submit(_regenerate_chunk, client, chunks[i], theme_prompt, regeneration_theme, i, len(chunks)): i
             for i in regen_indices
         }
         for future in as_completed(futures):
@@ -383,10 +328,11 @@ def regenerate_html(
         cleaned_body_parts.append(_STYLE_COMMENT_RE.sub("", part))
 
     style_block = f"\n{_build_style_block(style_rules)}" if style_rules else ""
+    body_html = _force_full_width_on_single_root_wrapper("".join(cleaned_body_parts))
 
     return (
         f"<!DOCTYPE html>\n<html>\n"
         f"<head>{head_content}{style_block}</head>\n"
-        f"<body>{''.join(cleaned_body_parts)}</body>\n"
+        f"<body>{body_html}</body>\n"
         f"</html>"
     )
