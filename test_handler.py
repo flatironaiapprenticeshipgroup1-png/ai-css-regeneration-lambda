@@ -68,6 +68,7 @@ with patch("boto3.client", side_effect=_boto3_client_factory), patch(
     "boto3.resource", return_value=_mock_dynamodb_resource
 ), patch("openai.OpenAI", return_value=_mock_openai_client):
     from lambda_function import (
+        _strip_code_fences,
         extract_selectors,
         find_missing_blocks,
         lambda_handler,
@@ -562,6 +563,72 @@ def test_regenerate_css_chunk_restores_dropped_rules():
     print("test_regenerate_css_chunk_restores_dropped_rules: PASSED")
 
 
+def test_strip_code_fences_unwraps_fully_fenced_response():
+    assert _strip_code_fences("```css\nbody{color:red}\n```") == "body{color:red}"
+    assert _strip_code_fences("```\nbody{color:red}\n```") == "body{color:red}"
+    print("test_strip_code_fences_unwraps_fully_fenced_response: PASSED")
+
+
+def test_strip_code_fences_leaves_unfenced_response_unchanged():
+    css = "body{color:red}"
+    assert _strip_code_fences(css) == css
+    print("test_strip_code_fences_leaves_unfenced_response_unchanged: PASSED")
+
+
+def test_strip_code_fences_handles_truncated_leading_only_fence():
+    text = "```css\nbody{color:red"
+    assert _strip_code_fences(text) == "body{color:red"
+    print("test_strip_code_fences_handles_truncated_leading_only_fence: PASSED")
+
+
+def test_regenerate_css_chunk_strips_code_fences_from_model_output():
+    """
+    End-to-end: when the mocked OpenAI response wraps its CSS in a markdown
+    code fence despite the prompt saying not to, the final S3-written CSS
+    must not contain the leaked fence markers.
+    """
+    (
+        mock_s3,
+        _,
+        _,
+        mock_dynamodb_resource,
+        mock_channel,
+        mock_ably_rest,
+        mock_openai,
+        boto3_client_factory,
+    ) = make_mocks()
+    mock_s3.get_object.return_value = {
+        "Body": MagicMock(read=lambda: b"body{color:red}")
+    }
+    mock_openai.chat.completions.create.return_value = MagicMock(
+        choices=[
+            MagicMock(
+                message=MagicMock(content="```css\nbody{color:neon}\n```"),
+                finish_reason="stop",
+            )
+        ],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+    _clear_modules()
+
+    with patch("boto3.client", side_effect=boto3_client_factory), patch(
+        "boto3.resource", return_value=mock_dynamodb_resource
+    ), patch("ably.AblyRest", return_value=mock_ably_rest), patch(
+        "openai.OpenAI", return_value=mock_openai
+    ):
+        import lambda_function
+
+        result = lambda_function.lambda_handler(make_event(), {})
+
+    assert result == {"batchItemFailures": []}
+
+    written_css = mock_s3.put_object.call_args.kwargs["Body"].decode("utf-8")
+    assert "```" not in written_css, "Code fence markers must not leak into the final CSS"
+    assert "body{color:neon}" in written_css
+
+    print("test_regenerate_css_chunk_strips_code_fences_from_model_output: PASSED")
+
+
 if __name__ == "__main__":
     test_happy_path_publishes_all_steps()
     test_openai_failure_publishes_failed()
@@ -573,4 +640,8 @@ if __name__ == "__main__":
     test_find_missing_blocks_detects_dropped_selector()
     test_find_missing_blocks_ignores_partial_class_name_matches()
     test_regenerate_css_chunk_restores_dropped_rules()
+    test_strip_code_fences_unwraps_fully_fenced_response()
+    test_strip_code_fences_leaves_unfenced_response_unchanged()
+    test_strip_code_fences_handles_truncated_leading_only_fence()
+    test_regenerate_css_chunk_strips_code_fences_from_model_output()
     print("All tests passed.")

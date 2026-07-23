@@ -14,6 +14,24 @@ dynamodb = boto3.resource("dynamodb")
 MAX_CHARS_PER_CHUNK = 30_000
 MAX_CONCURRENT_CHUNK_REQUESTS = 10
 
+_LEADING_CODE_FENCE_RE = re.compile(r"^\s*```[a-zA-Z0-9_-]*[ \t]*\n")
+_TRAILING_CODE_FENCE_RE = re.compile(r"\n?[ \t]*```\s*$")
+
+
+def _strip_code_fences(text: str) -> str:
+    """
+    Strips a leading ```css-style fence and/or trailing ``` fence the model
+    added despite being told not to. The two fences are stripped
+    independently so a response truncated at max_tokens before the model
+    closed its fence still has the leading one removed.
+    """
+    if not text:
+        return text
+    stripped = _LEADING_CODE_FENCE_RE.sub("", text, count=1)
+    stripped = _TRAILING_CODE_FENCE_RE.sub("", stripped, count=1)
+    return stripped
+
+
 def parse_css_blocks(css: str) -> list[str]:
     """Split CSS into top-level rule blocks (selector(s) + braces + body),
     tracking brace depth so nested rules (e.g. inside @media) stay intact
@@ -257,7 +275,7 @@ def lambda_handler(event, context):
                     message=f"Regenerated chunk {chunk_index + 1} of {total_chunks}"
                 )
 
-                regenerated_css = response.choices[0].message.content
+                regenerated_css = _strip_code_fences(response.choices[0].message.content)
                 missing_blocks = find_missing_blocks(chunk, regenerated_css)
                 if missing_blocks:
                     print(
