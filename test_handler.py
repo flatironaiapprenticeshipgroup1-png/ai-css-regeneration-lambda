@@ -470,6 +470,49 @@ def test_events_use_ai_phase():
     print("test_events_use_ai_phase: PASSED")
 
 
+def test_empty_original_css_completes_without_crashing():
+    """
+    A whitespace-only original-styles.css (e.g. an S3 object from a legacy or
+    retried job predating the crawler's "no source CSS" fallback) must not
+    crash ThreadPoolExecutor(max_workers=0). The job should complete with an
+    empty regenerated stylesheet rather than being marked failed.
+    """
+    (
+        mock_s3,
+        _,
+        _,
+        mock_dynamodb_resource,
+        mock_channel,
+        mock_ably_rest,
+        mock_openai,
+        boto3_client_factory,
+    ) = make_mocks()
+    mock_s3.get_object.return_value = {"Body": MagicMock(read=lambda: b"   \n\t  ")}
+    _clear_modules()
+
+    with patch("boto3.client", side_effect=boto3_client_factory), patch(
+        "boto3.resource", return_value=mock_dynamodb_resource
+    ), patch("ably.AblyRest", return_value=mock_ably_rest), patch(
+        "openai.OpenAI", return_value=mock_openai
+    ):
+        import lambda_function
+
+        result = lambda_function.lambda_handler(make_event(), {})
+
+    assert result == {"batchItemFailures": []}
+    mock_openai.chat.completions.create.assert_not_called()
+
+    steps = [c.args[1]["step"] for c in mock_channel.publish.call_args_list]
+    assert steps == ["chunking", "regenerating_css", "Finalizing"]
+
+    last = mock_channel.publish.call_args_list[-1].args[1]
+    assert last["status"] == "completed"
+
+    assert mock_s3.put_object.call_args.kwargs["Body"] == b""
+
+    print("test_empty_original_css_completes_without_crashing: PASSED")
+
+
 def test_extract_selectors_splits_comma_separated_group():
     """A rule with multiple comma-separated selectors should yield each one separately."""
     block = ".gb_H,\n.gb_I,\n.gb_J{fill:currentColor}"
