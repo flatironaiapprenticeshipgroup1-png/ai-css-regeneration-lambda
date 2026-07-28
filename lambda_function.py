@@ -234,11 +234,6 @@ def lambda_handler(event, context):
                         Add or rewrite box-shadow, text-shadow, and gradients,
                         Use background-image gradients where appropriate,
 
-                        ANIMATIONS:
-                        Add animations like hover effects or keyframe animations that fit the theme
-
-                        also add cool dramatic animations in the background to make the website more visually appealing and engaging
-
                         IT IS VERY IMPORTANT THAT THE WEBSITE LOOKS CLEAN AND NOT CLUNKY/MESSY
 
                         RULES:
