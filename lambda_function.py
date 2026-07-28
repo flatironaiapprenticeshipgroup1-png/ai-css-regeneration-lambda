@@ -205,10 +205,14 @@ def lambda_handler(event, context):
                 chunk_index: int,
                 total_chunks: int,
             ) -> str:
+                theme_description = (
+                    regeneration_theme if regeneration_theme
+                    else "modern practices while maintaining the original feel"
+                )
                 system_msg = (
                     f"""You are a CSS and web design expert specializing in dramatic visual transformations.
 
-                        You will receive chunks of a CSS file. Rewrite them completely to match this theme: {regeneration_theme}
+                        You will receive chunks of a CSS file. Rewrite them completely to match this theme: {theme_description}
 
                         You MUST change ALL of the following — not just colors:
 
@@ -218,9 +222,11 @@ def lambda_handler(event, context):
                         Change font sizes, weights, letter-spacing, and line-height to match the theme,
 
                         COLORS:
-                        Replace every background-color, color, and border-color,
-                        Build a cohesive color palette — do not just swap one color for another,
-                        Apply the palette consistently across all elements,
+                        If the theme names or strongly implies a specific color or hue (e.g. "neon pink", "forest green", "royal purple", "sunset orange"), that color IS the anchor of the palette — use it prominently and repeatedly as the dominant color, not as a token accent buried in a single rule,
+                        Derive every other color in the palette FROM that anchor — complementary/analogous hues, plus lighter tints and darker shades of the anchor itself for hover states, borders, and backgrounds — rather than inventing unrelated colors,
+                        If the theme does not name a color, choose one cohesive anchor hue that fits the theme's mood and build the palette the same way,
+                        Replace every background-color, color, and border-color using this palette,
+                        Apply the palette consistently across all elements — the same handful of colors (plus their tints/shades) should recur throughout the whole stylesheet, not a different color per selector,
 
                         BORDERS & SHAPES:
                         Change border styles, widths, and border-radius values,

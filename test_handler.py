@@ -513,6 +513,47 @@ def test_empty_original_css_completes_without_crashing():
     print("test_empty_original_css_completes_without_crashing: PASSED")
 
 
+def test_no_theme_does_not_leak_none_into_system_prompt():
+    """
+    When RegenerationTheme is omitted/null, the system prompt must not contain
+    the literal string "None" (a bare f-string interpolation of the None
+    value) and should instead fall back to the same "modern practices"
+    language already used in the user message's theme_prompt.
+    """
+    (
+        _,
+        _,
+        _,
+        mock_dynamodb_resource,
+        mock_channel,
+        mock_ably_rest,
+        mock_openai,
+        boto3_client_factory,
+    ) = make_mocks()
+    _clear_modules()
+
+    with patch("boto3.client", side_effect=boto3_client_factory), patch(
+        "boto3.resource", return_value=mock_dynamodb_resource
+    ), patch("ably.AblyRest", return_value=mock_ably_rest), patch(
+        "openai.OpenAI", return_value=mock_openai
+    ):
+        import lambda_function
+
+        result = lambda_function.lambda_handler(make_event(theme=None), {})
+
+    assert result == {"batchItemFailures": []}
+
+    messages = mock_openai.chat.completions.create.call_args.kwargs["messages"]
+    system_msg = next(m["content"] for m in messages if m["role"] == "system")
+    user_msg = next(m["content"] for m in messages if m["role"] == "user")
+
+    assert "None" not in system_msg, f"System prompt leaked literal None: {system_msg}"
+    assert "modern practices while maintaining the original feel" in system_msg
+    assert "modern practices while maintaining the original feel" in user_msg
+
+    print("test_no_theme_does_not_leak_none_into_system_prompt: PASSED")
+
+
 def test_extract_selectors_splits_comma_separated_group():
     """A rule with multiple comma-separated selectors should yield each one separately."""
     block = ".gb_H,\n.gb_I,\n.gb_J{fill:currentColor}"
