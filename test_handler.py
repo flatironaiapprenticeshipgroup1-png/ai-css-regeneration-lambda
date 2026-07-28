@@ -73,6 +73,7 @@ with patch("boto3.client", side_effect=_boto3_client_factory), patch(
         find_missing_blocks,
         lambda_handler,
         parse_css_blocks,
+        strip_colors_from_block,
     )
 
 
@@ -597,6 +598,84 @@ def test_find_missing_blocks_ignores_partial_class_name_matches():
     missing = find_missing_blocks(original_chunk, regenerated)
     assert len(missing) == 1
     print("test_find_missing_blocks_ignores_partial_class_name_matches: PASSED")
+
+
+def test_strip_colors_from_block_removes_color_only_declarations():
+    """background-color/color must be dropped entirely, not just reformatted."""
+    block = ".site-header {\n  background-color: #CC0000;\n  text-align: center;\n  padding: 10px 0;\n}"
+    result = strip_colors_from_block(block)
+    assert "#CC0000" not in result
+    assert "background-color" not in result
+    assert "text-align: center" in result
+    assert "padding: 10px 0" in result
+    print("test_strip_colors_from_block_removes_color_only_declarations: PASSED")
+
+
+def test_strip_colors_from_block_strips_color_token_from_mixed_shorthand():
+    """border: <width> <style> <color> keeps width/style, loses only the color."""
+    block = ".site-header { border-bottom: 5px solid #FFFF00; }"
+    result = strip_colors_from_block(block)
+    assert "#FFFF00" not in result
+    assert "5px" in result
+    assert "solid" in result
+    print("test_strip_colors_from_block_strips_color_token_from_mixed_shorthand: PASSED")
+
+
+def test_strip_colors_from_block_leaves_nested_rules_untouched():
+    """@media-wrapped blocks aren't brace-aware-safe to rewrite, so skip them."""
+    block = "@media (max-width: 600px) { .foo { color: red; } }"
+    assert strip_colors_from_block(block) == block
+    print("test_strip_colors_from_block_leaves_nested_rules_untouched: PASSED")
+
+
+def test_regenerate_css_chunk_restores_dropped_rules_without_original_color():
+    """
+    End-to-end reproduction of the "random red/blue background" bug: when the
+    model drops a selector that had an original background-color, the
+    restored fallback rule must keep the selector's layout but not leak its
+    original off-theme color back into the output.
+    """
+    (
+        mock_s3,
+        _,
+        _,
+        mock_dynamodb_resource,
+        mock_channel,
+        mock_ably_rest,
+        mock_openai,
+        boto3_client_factory,
+    ) = make_mocks()
+    mock_s3.get_object.return_value = {
+        "Body": MagicMock(
+            read=lambda: b".site-header{background-color:#CC0000;padding:10px 0}\n\nbody{color:red}"
+        )
+    }
+    # The model rewrites "body" but drops ".site-header" entirely.
+    mock_openai.chat.completions.create.return_value = MagicMock(
+        choices=[
+            MagicMock(message=MagicMock(content="body{color:black}"), finish_reason="stop")
+        ],
+        usage=MagicMock(prompt_tokens=100, completion_tokens=200),
+    )
+    _clear_modules()
+
+    with patch("boto3.client", side_effect=boto3_client_factory), patch(
+        "boto3.resource", return_value=mock_dynamodb_resource
+    ), patch("ably.AblyRest", return_value=mock_ably_rest), patch(
+        "openai.OpenAI", return_value=mock_openai
+    ):
+        import lambda_function
+
+        result = lambda_function.lambda_handler(make_event(), {})
+
+    assert result == {"batchItemFailures": []}
+
+    written_css = mock_s3.put_object.call_args.kwargs["Body"].decode("utf-8")
+    assert ".site-header" in written_css, "Dropped selector should still be restored"
+    assert "padding: 10px 0" in written_css, "Layout should survive the restore"
+    assert "#CC0000" not in written_css, "Original off-theme color must not leak through"
+
+    print("test_regenerate_css_chunk_restores_dropped_rules_without_original_color: PASSED")
 
 
 def test_regenerate_css_chunk_restores_dropped_rules():

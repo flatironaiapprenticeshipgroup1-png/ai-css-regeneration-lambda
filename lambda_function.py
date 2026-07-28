@@ -105,6 +105,98 @@ def find_missing_blocks(original_chunk: str, regenerated_css: str) -> list[str]:
     return missing
 
 
+# Declarations that are purely about color/decoration — dropped entirely when
+# restoring a block the model omitted, so a restored block can't smuggle the
+# original (untheme) color back in. box-shadow/text-shadow are included since
+# their color is the whole point of the declaration.
+_COLOR_ONLY_PROPERTIES = {
+    "background-color", "color", "border-color",
+    "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
+    "outline-color", "text-decoration-color", "caret-color", "column-rule-color",
+    "fill", "stroke",
+    "background", "background-image",
+    "box-shadow", "text-shadow",
+}
+
+# Shorthand properties that mix a color with non-color info (e.g.
+# "border: 3px ridge #FFFF00") — only the color token is stripped, so the
+# width/style survive and the element doesn't lose its shape.
+_MIXED_SHORTHAND_PROPERTIES = {
+    "border", "border-top", "border-right", "border-bottom", "border-left", "outline",
+}
+
+_COLOR_TOKEN_RE = re.compile(r"#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)|hsla?\([^)]*\)")
+
+
+def _split_declarations(body: str) -> list[str]:
+    """Split a CSS rule body into individual `prop: value` declarations on
+    top-level semicolons only — not ones inside quoted strings or function
+    calls like url() or rgba()."""
+    parts = []
+    current = []
+    depth = 0
+    quote = None
+    for ch in body:
+        if quote:
+            current.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            current.append(ch)
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(depth - 1, 0)
+        if ch == ";" and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+    if "".join(current).strip():
+        parts.append("".join(current))
+    return parts
+
+
+def strip_colors_from_block(block: str) -> str:
+    """Remove color-bearing declarations/tokens from a CSS rule block.
+
+    Used when restoring a block the model dropped: we still want its
+    layout/sizing (width, padding, border width/style, ...) so the element
+    doesn't fall back to unstyled, but not its original color, since that's
+    exactly what a theme regeneration is supposed to replace. Blocks with
+    nested rules (e.g. @media wrapping other selectors) are left untouched —
+    the flat declaration-splitting here isn't brace-aware enough for those.
+    """
+    head, brace, rest = block.partition("{")
+    if not brace:
+        return block
+    body, close_brace, tail = rest.rpartition("}")
+    if not close_brace or "{" in body:
+        return block
+
+    kept = []
+    for decl in _split_declarations(body):
+        name, sep, value = decl.partition(":")
+        if not sep:
+            continue
+        prop = name.strip().lower()
+        if prop in _COLOR_ONLY_PROPERTIES:
+            continue
+        if prop in _MIXED_SHORTHAND_PROPERTIES:
+            new_value = re.sub(r"\s+", " ", _COLOR_TOKEN_RE.sub("", value)).strip()
+            if not new_value:
+                continue
+            kept.append(f"{prop}: {new_value}")
+            continue
+        kept.append(f"{prop}: {value.strip()}")
+
+    new_body = "; ".join(kept) + (";" if kept else "")
+    return f"{head}{brace} {new_body} {close_brace}{tail}"
+
+
 def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
     blocks = parse_css_blocks(css)
     chunks = []
@@ -281,12 +373,14 @@ def lambda_handler(event, context):
                 if missing_blocks:
                     print(
                         f"Chunk {chunk_index + 1}/{total_chunks}: model dropped {len(missing_blocks)} "
-                        f"rule block(s); restoring original CSS for those selectors so elements don't "
-                        f"fall back to unstyled/default sizing"
+                        f"rule block(s); restoring their layout (with colors stripped) so elements "
+                        f"don't fall back to unstyled/default sizing without reintroducing the "
+                        f"original off-theme colors"
                     )
+                    restored_blocks = [strip_colors_from_block(b) for b in missing_blocks]
                     regenerated_css += (
-                        "\n\n/* Restored: original rules omitted by AI regeneration */\n"
-                        + "\n\n".join(missing_blocks)
+                        "\n\n/* Restored: original rules omitted by AI regeneration (colors stripped) */\n"
+                        + "\n\n".join(restored_blocks)
                     )
                 return regenerated_css
 
