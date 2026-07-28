@@ -312,28 +312,20 @@ def lambda_handler(event, context):
             print(f"Split CSS into {len(chunks)} chunk(s) for processing")
 
             # process all chunks in parallel (I/O-bound — threads wait on OpenAI, not CPU)
+            results = {}
             publish(step="regenerating_css", status="ai_lambda_processing", message="Ai Regenerating Styling CSS for the website")
-            if not chunks:
-                # Original stylesheet had no rule blocks (e.g. an empty/whitespace-only
-                # original-styles.css from a legacy or retried job) — nothing to send
-                # to the model. ThreadPoolExecutor requires max_workers > 0, so this
-                # must be short-circuited rather than handed to the pool below.
-                print("No CSS rule blocks to regenerate; producing empty stylesheet")
-                regenerated_css = ""
-            else:
-                results = {}
-                with ThreadPoolExecutor(max_workers=min(len(chunks), MAX_CONCURRENT_CHUNK_REQUESTS)) as executor:
-                    futures = {
-                        executor.submit(regenerate_css_chunk, client, chunk, theme_prompt, i, len(chunks)): i
-                        for i, chunk in enumerate(chunks)
-                    }
-                    for future in as_completed(futures):
-                        idx = futures[future]
-                        results[idx] = future.result()
+            with ThreadPoolExecutor(max_workers=min(len(chunks), MAX_CONCURRENT_CHUNK_REQUESTS)) as executor:
+                futures = {
+                    executor.submit(regenerate_css_chunk, client, chunk, theme_prompt, i, len(chunks)): i
+                    for i, chunk in enumerate(chunks)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    results[idx] = future.result()
 
-                regenerated_parts = [results[i] for i in range(len(chunks))]
-                regenerated_css = "\n\n".join(regenerated_parts)
+            regenerated_parts = [results[i] for i in range(len(chunks))]
 
+            regenerated_css = "\n\n".join(regenerated_parts)
             print(f"Regenerated CSS total size: {len(regenerated_css)} characters")
 
             s3.put_object(
