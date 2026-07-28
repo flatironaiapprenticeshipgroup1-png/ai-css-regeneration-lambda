@@ -73,6 +73,7 @@ with patch("boto3.client", side_effect=_boto3_client_factory), patch(
         find_missing_blocks,
         lambda_handler,
         parse_css_blocks,
+        split_css_into_chunks,
         strip_colors_from_block,
     )
 
@@ -560,6 +561,62 @@ def test_extract_selectors_splits_comma_separated_group():
     block = ".gb_H,\n.gb_I,\n.gb_J{fill:currentColor}"
     assert extract_selectors(block) == [".gb_H", ".gb_I", ".gb_J"]
     print("test_extract_selectors_splits_comma_separated_group: PASSED")
+
+
+def test_split_css_into_chunks_recurses_into_oversized_layer_block():
+    """
+    Reproduces the github.com bug: a single @layer block wrapping thousands
+    of nested rules is one giant "block" as far as parse_css_blocks is
+    concerned. Naively char-slicing it at the max_chars boundary cuts through
+    selectors mid-token and hands the model unparseable garbage — which is
+    why so much of a large real-world stylesheet used to fall back to
+    "restored" (i.e. untouched, untheme'd) original CSS. Splitting must
+    instead recurse into the nested rules and re-wrap each piece in the same
+    @layer prelude, producing brace-balanced, syntactically valid chunks.
+    """
+    inner_rules = "".join(f".sel-{i}{{color:red;padding:{i}px}}\n" for i in range(400))
+    css = f"@layer test-layer{{{inner_rules}}}"
+    assert len(css) > 5_000, "fixture must actually exceed the chunk limit to exercise the split"
+
+    chunks = split_css_into_chunks(css, max_chars=5_000)
+    assert len(chunks) > 1, "an oversized block must actually get split into multiple chunks"
+
+    for chunk in chunks:
+        assert chunk.count("{") == chunk.count("}"), f"chunk is not brace-balanced: {chunk[:80]}..."
+        assert chunk.strip().startswith("@layer test-layer{"), "each piece must be re-wrapped in the original prelude"
+
+    # No selector should be lost or duplicated across the split.
+    combined = "\n".join(chunks)
+    for i in (0, 150, 399):
+        assert f".sel-{i}{{" in combined
+
+    print("test_split_css_into_chunks_recurses_into_oversized_layer_block: PASSED")
+
+
+def test_split_css_into_chunks_splits_oversized_flat_declaration_list():
+    """
+    A single selector with a huge flat list of declarations (e.g. GitHub's
+    [data-color-mode=...] blocks of hundreds of CSS custom properties) has no
+    nested rules to recurse into — it must be split at declaration
+    boundaries instead, repeating the selector on each piece, rather than
+    char-sliced mid-declaration.
+    """
+    declarations = "".join(f"--var-{i}:#{i:06d};" for i in range(2000))
+    css = f"[data-theme=light]{{{declarations}}}"
+    assert len(css) > 5_000
+
+    chunks = split_css_into_chunks(css, max_chars=5_000)
+    assert len(chunks) > 1
+
+    for chunk in chunks:
+        assert chunk.count("{") == chunk.count("}")
+        assert chunk.strip().startswith("[data-theme=light]{")
+
+    combined = "\n".join(chunks)
+    for i in (0, 1000, 1999):
+        assert f"--var-{i}:" in combined
+
+    print("test_split_css_into_chunks_splits_oversized_flat_declaration_list: PASSED")
 
 
 def test_find_missing_blocks_detects_dropped_selector():

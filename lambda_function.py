@@ -197,8 +197,8 @@ def strip_colors_from_block(block: str) -> str:
     return f"{head}{brace} {new_body} {close_brace}{tail}"
 
 
-def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
-    blocks = parse_css_blocks(css)
+def _pack_into_chunks(blocks: list[str], max_chars: int) -> list[str]:
+    """Bin-pack rule blocks into <= max_chars chunks, joined with blank lines."""
     chunks = []
     current_chunk_parts = []
     current_chunk_size = 0
@@ -206,16 +206,12 @@ def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> lis
     for block in blocks:
         block_size = len(block)
 
-        # A single block (e.g. a @font-face rule with an embedded base64
-        # data URI) can itself exceed max_chars. Splitting can't respect CSS
-        # syntax at this size, so just slice it into max_chars-sized pieces.
         if block_size > max_chars:
             if current_chunk_parts:
                 chunks.append("\n\n".join(current_chunk_parts))
                 current_chunk_parts = []
                 current_chunk_size = 0
-            for start in range(0, block_size, max_chars):
-                chunks.append(block[start:start + max_chars])
+            chunks.extend(_split_oversized_block(block, max_chars))
             continue
 
         if current_chunk_parts and current_chunk_size + block_size > max_chars:
@@ -230,6 +226,74 @@ def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> lis
         chunks.append("\n\n".join(current_chunk_parts))
 
     return chunks
+
+
+def _pack_strings(parts: list[str], max_chars: int) -> list[str]:
+    """Bin-pack arbitrary strings (e.g. CSS declarations) into semicolon-joined
+    groups <= max_chars. A single part that's itself larger than max_chars
+    becomes its own (oversized) group rather than being cut mid-token."""
+    groups = []
+    current = []
+    current_size = 0
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        size = len(part) + 2  # account for the "; " joiner
+        if current and current_size + size > max_chars:
+            groups.append("; ".join(current) + ";")
+            current = [part]
+            current_size = size
+        else:
+            current.append(part)
+            current_size += size
+    if current:
+        groups.append("; ".join(current) + ";")
+    return groups
+
+
+def _split_oversized_block(block: str, max_chars: int) -> list[str]:
+    """Split a single CSS block that exceeds max_chars into syntactically
+    valid pieces, instead of slicing raw characters.
+
+    Real-world stylesheets (GitHub's, notably) wrap huge numbers of rules
+    inside one @layer or @media block — e.g. a single @layer block that's
+    700,000+ characters and contains thousands of nested selectors, all
+    counted by parse_css_blocks as one "block" since it only flushes at brace
+    depth 0. Naively slicing that at a fixed character offset cuts through
+    selectors and declarations at random, handing the model unparseable CSS
+    fragments it can't meaningfully rewrite — which is why so much ends up
+    silently falling back to the original, untheme'd rules.
+
+    Instead: if the block wraps nested rules, recurse into them and re-wrap
+    each resulting piece in the same prelude (e.g. "@layer name{...}") so
+    cascade-layer/media-query semantics are preserved. If it's a single
+    selector with an oversized flat declaration list (e.g. a huge block of
+    CSS custom properties), split at declaration boundaries instead. Only
+    truly unparseable content falls back to raw character slicing.
+    """
+    head, brace, rest = block.partition("{")
+    body, close_brace, tail = rest.rpartition("}") if brace else ("", "", "")
+
+    if not brace or not close_brace:
+        return [block[i:i + max_chars] for i in range(0, len(block), max_chars)]
+
+    prelude = f"{head}{brace}"
+    suffix = f"{close_brace}{tail}"
+    budget = max(max_chars - len(prelude) - len(suffix), 1)
+
+    if "{" in body:
+        pieces = _pack_into_chunks(parse_css_blocks(body), budget)
+    else:
+        pieces = _pack_strings(_split_declarations(body), budget)
+
+    if not pieces:
+        return [block]
+    return [f"{prelude}{piece}{suffix}" for piece in pieces]
+
+
+def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
+    return _pack_into_chunks(parse_css_blocks(css), max_chars)
 
 
 
