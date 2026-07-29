@@ -105,8 +105,100 @@ def find_missing_blocks(original_chunk: str, regenerated_css: str) -> list[str]:
     return missing
 
 
-def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
-    blocks = parse_css_blocks(css)
+# Declarations that are purely about color/decoration — dropped entirely when
+# restoring a block the model omitted, so a restored block can't smuggle the
+# original (untheme) color back in. box-shadow/text-shadow are included since
+# their color is the whole point of the declaration.
+_COLOR_ONLY_PROPERTIES = {
+    "background-color", "color", "border-color",
+    "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
+    "outline-color", "text-decoration-color", "caret-color", "column-rule-color",
+    "fill", "stroke",
+    "background", "background-image",
+    "box-shadow", "text-shadow",
+}
+
+# Shorthand properties that mix a color with non-color info (e.g.
+# "border: 3px ridge #FFFF00") — only the color token is stripped, so the
+# width/style survive and the element doesn't lose its shape.
+_MIXED_SHORTHAND_PROPERTIES = {
+    "border", "border-top", "border-right", "border-bottom", "border-left", "outline",
+}
+
+_COLOR_TOKEN_RE = re.compile(r"#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)|hsla?\([^)]*\)")
+
+
+def _split_declarations(body: str) -> list[str]:
+    """Split a CSS rule body into individual `prop: value` declarations on
+    top-level semicolons only — not ones inside quoted strings or function
+    calls like url() or rgba()."""
+    parts = []
+    current = []
+    depth = 0
+    quote = None
+    for ch in body:
+        if quote:
+            current.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            current.append(ch)
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(depth - 1, 0)
+        if ch == ";" and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+    if "".join(current).strip():
+        parts.append("".join(current))
+    return parts
+
+
+def strip_colors_from_block(block: str) -> str:
+    """Remove color-bearing declarations/tokens from a CSS rule block.
+
+    Used when restoring a block the model dropped: we still want its
+    layout/sizing (width, padding, border width/style, ...) so the element
+    doesn't fall back to unstyled, but not its original color, since that's
+    exactly what a theme regeneration is supposed to replace. Blocks with
+    nested rules (e.g. @media wrapping other selectors) are left untouched —
+    the flat declaration-splitting here isn't brace-aware enough for those.
+    """
+    head, brace, rest = block.partition("{")
+    if not brace:
+        return block
+    body, close_brace, tail = rest.rpartition("}")
+    if not close_brace or "{" in body:
+        return block
+
+    kept = []
+    for decl in _split_declarations(body):
+        name, sep, value = decl.partition(":")
+        if not sep:
+            continue
+        prop = name.strip().lower()
+        if prop in _COLOR_ONLY_PROPERTIES:
+            continue
+        if prop in _MIXED_SHORTHAND_PROPERTIES:
+            new_value = re.sub(r"\s+", " ", _COLOR_TOKEN_RE.sub("", value)).strip()
+            if not new_value:
+                continue
+            kept.append(f"{prop}: {new_value}")
+            continue
+        kept.append(f"{prop}: {value.strip()}")
+
+    new_body = "; ".join(kept) + (";" if kept else "")
+    return f"{head}{brace} {new_body} {close_brace}{tail}"
+
+
+def _pack_into_chunks(blocks: list[str], max_chars: int) -> list[str]:
+    """Bin-pack rule blocks into <= max_chars chunks, joined with blank lines."""
     chunks = []
     current_chunk_parts = []
     current_chunk_size = 0
@@ -114,16 +206,12 @@ def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> lis
     for block in blocks:
         block_size = len(block)
 
-        # A single block (e.g. a @font-face rule with an embedded base64
-        # data URI) can itself exceed max_chars. Splitting can't respect CSS
-        # syntax at this size, so just slice it into max_chars-sized pieces.
         if block_size > max_chars:
             if current_chunk_parts:
                 chunks.append("\n\n".join(current_chunk_parts))
                 current_chunk_parts = []
                 current_chunk_size = 0
-            for start in range(0, block_size, max_chars):
-                chunks.append(block[start:start + max_chars])
+            chunks.extend(_split_oversized_block(block, max_chars))
             continue
 
         if current_chunk_parts and current_chunk_size + block_size > max_chars:
@@ -138,6 +226,74 @@ def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> lis
         chunks.append("\n\n".join(current_chunk_parts))
 
     return chunks
+
+
+def _pack_strings(parts: list[str], max_chars: int) -> list[str]:
+    """Bin-pack arbitrary strings (e.g. CSS declarations) into semicolon-joined
+    groups <= max_chars. A single part that's itself larger than max_chars
+    becomes its own (oversized) group rather than being cut mid-token."""
+    groups = []
+    current = []
+    current_size = 0
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        size = len(part) + 2  # account for the "; " joiner
+        if current and current_size + size > max_chars:
+            groups.append("; ".join(current) + ";")
+            current = [part]
+            current_size = size
+        else:
+            current.append(part)
+            current_size += size
+    if current:
+        groups.append("; ".join(current) + ";")
+    return groups
+
+
+def _split_oversized_block(block: str, max_chars: int) -> list[str]:
+    """Split a single CSS block that exceeds max_chars into syntactically
+    valid pieces, instead of slicing raw characters.
+
+    Real-world stylesheets (GitHub's, notably) wrap huge numbers of rules
+    inside one @layer or @media block — e.g. a single @layer block that's
+    700,000+ characters and contains thousands of nested selectors, all
+    counted by parse_css_blocks as one "block" since it only flushes at brace
+    depth 0. Naively slicing that at a fixed character offset cuts through
+    selectors and declarations at random, handing the model unparseable CSS
+    fragments it can't meaningfully rewrite — which is why so much ends up
+    silently falling back to the original, untheme'd rules.
+
+    Instead: if the block wraps nested rules, recurse into them and re-wrap
+    each resulting piece in the same prelude (e.g. "@layer name{...}") so
+    cascade-layer/media-query semantics are preserved. If it's a single
+    selector with an oversized flat declaration list (e.g. a huge block of
+    CSS custom properties), split at declaration boundaries instead. Only
+    truly unparseable content falls back to raw character slicing.
+    """
+    head, brace, rest = block.partition("{")
+    body, close_brace, tail = rest.rpartition("}") if brace else ("", "", "")
+
+    if not brace or not close_brace:
+        return [block[i:i + max_chars] for i in range(0, len(block), max_chars)]
+
+    prelude = f"{head}{brace}"
+    suffix = f"{close_brace}{tail}"
+    budget = max(max_chars - len(prelude) - len(suffix), 1)
+
+    if "{" in body:
+        pieces = _pack_into_chunks(parse_css_blocks(body), budget)
+    else:
+        pieces = _pack_strings(_split_declarations(body), budget)
+
+    if not pieces:
+        return [block]
+    return [f"{prelude}{piece}{suffix}" for piece in pieces]
+
+
+def split_css_into_chunks(css: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
+    return _pack_into_chunks(parse_css_blocks(css), max_chars)
 
 
 
@@ -205,10 +361,14 @@ def lambda_handler(event, context):
                 chunk_index: int,
                 total_chunks: int,
             ) -> str:
+                theme_description = (
+                    regeneration_theme if regeneration_theme
+                    else "modern practices while maintaining the original feel"
+                )
                 system_msg = (
                     f"""You are a CSS and web design expert specializing in dramatic visual transformations.
 
-                        You will receive chunks of a CSS file. Rewrite them completely to match this theme: {regeneration_theme}
+                        You will receive chunks of a CSS file. Rewrite them completely to match this theme: {theme_description}
 
                         You MUST change ALL of the following — not just colors:
 
@@ -218,9 +378,11 @@ def lambda_handler(event, context):
                         Change font sizes, weights, letter-spacing, and line-height to match the theme,
 
                         COLORS:
-                        Replace every background-color, color, and border-color,
-                        Build a cohesive color palette — do not just swap one color for another,
-                        Apply the palette consistently across all elements,
+                        If the theme names or strongly implies a specific color or hue (e.g. "neon pink", "forest green", "royal purple", "sunset orange"), that color IS the anchor of the palette — use it prominently and repeatedly as the dominant color, not as a token accent buried in a single rule,
+                        Derive every other color in the palette FROM that anchor — complementary/analogous hues, plus lighter tints and darker shades of the anchor itself for hover states, borders, and backgrounds — rather than inventing unrelated colors,
+                        If the theme does not name a color, choose one cohesive anchor hue that fits the theme's mood and build the palette the same way,
+                        Replace every background-color, color, and border-color using this palette,
+                        Apply the palette consistently across all elements — the same handful of colors (plus their tints/shades) should recur throughout the whole stylesheet, not a different color per selector,
 
                         BORDERS & SHAPES:
                         Change border styles, widths, and border-radius values,
@@ -233,11 +395,6 @@ def lambda_handler(event, context):
                         DECORATIVE EFFECTS:
                         Add or rewrite box-shadow, text-shadow, and gradients,
                         Use background-image gradients where appropriate,
-
-                        ANIMATIONS:
-                        Add animations like hover effects or keyframe animations that fit the theme
-
-                        also add cool dramatic animations in the background to make the website more visually appealing and engaging
 
                         IT IS VERY IMPORTANT THAT THE WEBSITE LOOKS CLEAN AND NOT CLUNKY/MESSY
 
@@ -280,12 +437,14 @@ def lambda_handler(event, context):
                 if missing_blocks:
                     print(
                         f"Chunk {chunk_index + 1}/{total_chunks}: model dropped {len(missing_blocks)} "
-                        f"rule block(s); restoring original CSS for those selectors so elements don't "
-                        f"fall back to unstyled/default sizing"
+                        f"rule block(s); restoring their layout (with colors stripped) so elements "
+                        f"don't fall back to unstyled/default sizing without reintroducing the "
+                        f"original off-theme colors"
                     )
+                    restored_blocks = [strip_colors_from_block(b) for b in missing_blocks]
                     regenerated_css += (
-                        "\n\n/* Restored: original rules omitted by AI regeneration */\n"
-                        + "\n\n".join(missing_blocks)
+                        "\n\n/* Restored: original rules omitted by AI regeneration (colors stripped) */\n"
+                        + "\n\n".join(restored_blocks)
                     )
                 return regenerated_css
 
